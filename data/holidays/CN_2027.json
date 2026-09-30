@@ -1,0 +1,80 @@
+[
+  {
+    "counties": null,
+    "countryCode": "CN",
+    "date": "2027-01-01",
+    "fixed": false,
+    "global": true,
+    "launchYear": null,
+    "localName": "元旦",
+    "name": "New Year's Day",
+    "types": [
+      "Public"
+    ]
+  },
+  {
+    "counties": null,
+    "countryCode": "CN",
+    "date": "2027-02-06",
+    "fixed": false,
+    "global": true,
+    "launchYear": null,
+    "localName": "春节",
+    "name": "Chinese New Year (Spring Festival)",
+    "types": [
+      "Public"
+    ]
+  },
+  {
+    "counties": null,
+    "countryCode": "CN",
+    "date": "2027-05-01",
+    "fixed": false,
+    "global": true,
+    "launchYear": null,
+    "localName": "劳动节",
+    "name": "Labour Day",
+    "types": [
+      "Public"
+    ]
+  },
+  {
+    "counties": null,
+    "countryCode": "CN",
+    "date": "2027-06-09",
+    "fixed": false,
+    "global": true,
+    "launchYear": null,
+    "localName": "端午节",
+    "name": "Dragon Boat Festival",
+    "types": [
+      "Public"
+    ]
+  },
+  {
+    "counties": null,
+    "countryCode": "CN",
+    "date": "2027-09-15",
+    "fixed": false,
+    "global": true,
+    "launchYear": null,
+    "localName": "中秋节",
+    "name": "Mid-Autumn Festival",
+    "types": [
+      "Public"
+    ]
+  },
+  {
+    "counties": null,
+    "countryCode": "CN",
+    "date": "2027-10-01",
+    "fixed": false,
+    "global": true,
+    "launchYear": null,
+    "localName": "国庆节",
+    "name": "National Day",
+    "types": [
+      "Public"
+    ]
+  }
+]

@@ -1,0 +1,473 @@
+[
+  {
+    "counties": null,
+    "countryCode": "CA",
+    "date": "2027-01-01",
+    "fixed": false,
+    "global": true,
+    "launchYear": null,
+    "localName": "New Year's Day",
+    "name": "New Year's Day",
+    "types": [
+      "Public"
+    ]
+  },
+  {
+    "counties": [
+      "CA-MB"
+    ],
+    "countryCode": "CA",
+    "date": "2027-02-15",
+    "fixed": false,
+    "global": false,
+    "launchYear": null,
+    "localName": "Louis Riel Day",
+    "name": "Louis Riel Day",
+    "types": [
+      "Public"
+    ]
+  },
+  {
+    "counties": [
+      "CA-PE"
+    ],
+    "countryCode": "CA",
+    "date": "2027-02-15",
+    "fixed": false,
+    "global": false,
+    "launchYear": null,
+    "localName": "Islander Day",
+    "name": "Islander Day",
+    "types": [
+      "Public"
+    ]
+  },
+  {
+    "counties": [
+      "CA-NS"
+    ],
+    "countryCode": "CA",
+    "date": "2027-02-15",
+    "fixed": false,
+    "global": false,
+    "launchYear": null,
+    "localName": "Heritage Day",
+    "name": "Heritage Day",
+    "types": [
+      "Public"
+    ]
+  },
+  {
+    "counties": [
+      "CA-AB",
+      "CA-BC",
+      "CA-NB",
+      "CA-ON",
+      "CA-SK"
+    ],
+    "countryCode": "CA",
+    "date": "2027-02-15",
+    "fixed": false,
+    "global": false,
+    "launchYear": null,
+    "localName": "Family Day",
+    "name": "Family Day",
+    "types": [
+      "Public"
+    ]
+  },
+  {
+    "counties": [
+      "CA-NL"
+    ],
+    "countryCode": "CA",
+    "date": "2027-03-17",
+    "fixed": false,
+    "global": false,
+    "launchYear": null,
+    "localName": "Saint Patrick's Day",
+    "name": "Saint Patrick's Day",
+    "types": [
+      "Public"
+    ]
+  },
+  {
+    "counties": null,
+    "countryCode": "CA",
+    "date": "2027-03-26",
+    "fixed": false,
+    "global": true,
+    "launchYear": null,
+    "localName": "Good Friday",
+    "name": "Good Friday",
+    "types": [
+      "Public"
+    ]
+  },
+  {
+    "counties": [
+      "CA-AB",
+      "CA-PE"
+    ],
+    "countryCode": "CA",
+    "date": "2027-03-29",
+    "fixed": false,
+    "global": false,
+    "launchYear": null,
+    "localName": "Easter Monday",
+    "name": "Easter Monday",
+    "types": [
+      "Public"
+    ]
+  },
+  {
+    "counties": [
+      "CA-NL"
+    ],
+    "countryCode": "CA",
+    "date": "2027-04-23",
+    "fixed": false,
+    "global": false,
+    "launchYear": null,
+    "localName": "Saint George's Day",
+    "name": "Saint George's Day",
+    "types": [
+      "Public"
+    ]
+  },
+  {
+    "counties": [
+      "CA-QC"
+    ],
+    "countryCode": "CA",
+    "date": "2027-05-24",
+    "fixed": false,
+    "global": false,
+    "launchYear": null,
+    "localName": "National Patriots' Day",
+    "name": "National Patriots' Day",
+    "types": [
+      "Public"
+    ]
+  },
+  {
+    "counties": null,
+    "countryCode": "CA",
+    "date": "2027-05-24",
+    "fixed": false,
+    "global": true,
+    "launchYear": null,
+    "localName": "Victoria Day",
+    "name": "Victoria Day",
+    "types": [
+      "Public"
+    ]
+  },
+  {
+    "counties": [
+      "CA-NT"
+    ],
+    "countryCode": "CA",
+    "date": "2027-06-21",
+    "fixed": false,
+    "global": false,
+    "launchYear": null,
+    "localName": "National Aboriginal Day",
+    "name": "National Aboriginal Day",
+    "types": [
+      "Public"
+    ]
+  },
+  {
+    "counties": [
+      "CA-NL"
+    ],
+    "countryCode": "CA",
+    "date": "2027-06-24",
+    "fixed": false,
+    "global": false,
+    "launchYear": null,
+    "localName": "Discovery Day",
+    "name": "Discovery Day",
+    "types": [
+      "Public"
+    ]
+  },
+  {
+    "counties": [
+      "CA-QC"
+    ],
+    "countryCode": "CA",
+    "date": "2027-06-24",
+    "fixed": false,
+    "global": false,
+    "launchYear": null,
+    "localName": "Fête nationale du Québec",
+    "name": "National Holiday",
+    "types": [
+      "Public"
+    ]
+  },
+  {
+    "counties": null,
+    "countryCode": "CA",
+    "date": "2027-07-01",
+    "fixed": false,
+    "global": true,
+    "launchYear": null,
+    "localName": "Canada Day",
+    "name": "Canada Day",
+    "types": [
+      "Public"
+    ]
+  },
+  {
+    "counties": [
+      "CA-NL"
+    ],
+    "countryCode": "CA",
+    "date": "2027-07-12",
+    "fixed": false,
+    "global": false,
+    "launchYear": null,
+    "localName": "Orangemen's Day",
+    "name": "Orangemen's Day",
+    "types": [
+      "Public"
+    ]
+  },
+  {
+    "counties": [
+      "CA-MB",
+      "CA-NL",
+      "CA-NT",
+      "CA-NU",
+      "CA-ON"
+    ],
+    "countryCode": "CA",
+    "date": "2027-08-02",
+    "fixed": false,
+    "global": false,
+    "launchYear": null,
+    "localName": "Civic Holiday",
+    "name": "Civic Holiday",
+    "types": [
+      "Public"
+    ]
+  },
+  {
+    "counties": [
+      "CA-BC"
+    ],
+    "countryCode": "CA",
+    "date": "2027-08-02",
+    "fixed": false,
+    "global": false,
+    "launchYear": null,
+    "localName": "British Columbia Day",
+    "name": "British Columbia Day",
+    "types": [
+      "Public"
+    ]
+  },
+  {
+    "counties": [
+      "CA-AB",
+      "CA-YT"
+    ],
+    "countryCode": "CA",
+    "date": "2027-08-02",
+    "fixed": false,
+    "global": false,
+    "launchYear": null,
+    "localName": "Heritage Day",
+    "name": "Heritage Day",
+    "types": [
+      "Public"
+    ]
+  },
+  {
+    "counties": [
+      "CA-NB"
+    ],
+    "countryCode": "CA",
+    "date": "2027-08-02",
+    "fixed": false,
+    "global": false,
+    "launchYear": null,
+    "localName": "New Brunswick Day",
+    "name": "New Brunswick Day",
+    "types": [
+      "Public"
+    ]
+  },
+  {
+    "counties": [
+      "CA-NS"
+    ],
+    "countryCode": "CA",
+    "date": "2027-08-02",
+    "fixed": false,
+    "global": false,
+    "launchYear": null,
+    "localName": "Natal Day",
+    "name": "Natal Day",
+    "types": [
+      "Public"
+    ]
+  },
+  {
+    "counties": [
+      "CA-SK"
+    ],
+    "countryCode": "CA",
+    "date": "2027-08-02",
+    "fixed": false,
+    "global": false,
+    "launchYear": null,
+    "localName": "Saskatchewan Day",
+    "name": "Saskatchewan Day",
+    "types": [
+      "Public"
+    ]
+  },
+  {
+    "counties": [
+      "CA-PE"
+    ],
+    "countryCode": "CA",
+    "date": "2027-08-16",
+    "fixed": false,
+    "global": false,
+    "launchYear": null,
+    "localName": "Gold Cup Parade Day",
+    "name": "Gold Cup Parade Day",
+    "types": [
+      "Public"
+    ]
+  },
+  {
+    "counties": [
+      "CA-YT"
+    ],
+    "countryCode": "CA",
+    "date": "2027-08-16",
+    "fixed": false,
+    "global": false,
+    "launchYear": null,
+    "localName": "Discovery Day",
+    "name": "Discovery Day",
+    "types": [
+      "Public"
+    ]
+  },
+  {
+    "counties": null,
+    "countryCode": "CA",
+    "date": "2027-09-06",
+    "fixed": false,
+    "global": true,
+    "launchYear": null,
+    "localName": "Labour Day",
+    "name": "Labour Day",
+    "types": [
+      "Public"
+    ]
+  },
+  {
+    "counties": null,
+    "countryCode": "CA",
+    "date": "2027-09-30",
+    "fixed": false,
+    "global": true,
+    "launchYear": null,
+    "localName": "National Day for Truth and Reconciliation",
+    "name": "National Day for Truth and Reconciliation",
+    "types": [
+      "Public"
+    ]
+  },
+  {
+    "counties": null,
+    "countryCode": "CA",
+    "date": "2027-10-11",
+    "fixed": false,
+    "global": true,
+    "launchYear": null,
+    "localName": "Thanksgiving",
+    "name": "Thanksgiving",
+    "types": [
+      "Public"
+    ]
+  },
+  {
+    "counties": [
+      "CA-NL"
+    ],
+    "countryCode": "CA",
+    "date": "2027-11-11",
+    "fixed": false,
+    "global": false,
+    "launchYear": null,
+    "localName": "Armistice Day",
+    "name": "Armistice Day",
+    "types": [
+      "Public"
+    ]
+  },
+  {
+    "counties": [
+      "CA-AB",
+      "CA-BC",
+      "CA-NB",
+      "CA-NT",
+      "CA-NS",
+      "CA-NU",
+      "CA-PE",
+      "CA-SK",
+      "CA-YT"
+    ],
+    "countryCode": "CA",
+    "date": "2027-11-11",
+    "fixed": false,
+    "global": false,
+    "launchYear": null,
+    "localName": "Remembrance Day",
+    "name": "Remembrance Day",
+    "types": [
+      "Public"
+    ]
+  },
+  {
+    "counties": null,
+    "countryCode": "CA",
+    "date": "2027-12-25",
+    "fixed": false,
+    "global": true,
+    "launchYear": null,
+    "localName": "Christmas Day",
+    "name": "Christmas Day",
+    "types": [
+      "Public"
+    ]
+  },
+  {
+    "counties": [
+      "CA-AB",
+      "CA-NB",
+      "CA-NS",
+      "CA-ON",
+      "CA-PE"
+    ],
+    "countryCode": "CA",
+    "date": "2027-12-26",
+    "fixed": false,
+    "global": false,
+    "launchYear": null,
+    "localName": "Boxing Day",
+    "name": "St. Stephen's Day",
+    "types": [
+      "Public"
+    ]
+  }
+]
