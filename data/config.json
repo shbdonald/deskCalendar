@@ -1,7 +1,7 @@
 {
   "defaults": {
     "x": 80,
-    "y": 80,
+    "y": 5,
     "countries": [
       "CN"
     ],
@@ -9,11 +9,11 @@
     "opacity": 0.92,
     "size_locked": true,
     "display_w": 565,
-    "display_h": 114,
+    "display_h": 155,
     "window_w": 565,
-    "window_h": 114,
+    "window_h": 155,
     "cell_w": 75,
-    "cell_h": 64,
+    "cell_h": 105,
     "theme": {
       "bg": "#1A1F26",
       "text": "#EEF2F6",
@@ -25,35 +25,20 @@
       "btn": "#2A313C",
       "btn_hover": "#3A4554",
       "border": "#00000000"
-    }
-  },
-  "session": {
-    "x": 828,
-    "y": 21,
-    "countries": [
-      "CA",
-      "CN"
-    ],
-    "expanded": true,
-    "opacity": 0.8471,
-    "size_locked": false,
-    "display_w": 838,
-    "display_h": 742,
-    "window_w": 838,
-    "window_h": 158,
-    "cell_w": 114,
-    "cell_h": 108,
-    "theme": {
-      "bg": "#0D1B1E",
-      "text": "#E6F2F1",
-      "muted": "#7FA6A3",
-      "accent": "#2DD4BF",
-      "holiday": "#FBBF24",
-      "cell": "#143033",
-      "cell_today": "#1A4A4E",
-      "btn": "#1B3A3D",
-      "btn_hover": "#245458",
-      "border": "#00000000"
-    }
+    },
+    "icloud_sync_enabled": false,
+    "icloud_calendar_name": "桌面计划",
+    "icloud_poll_seconds": 45,
+    "icloud_calendars_enabled": [],
+    "icloud_calendars_enabled_names": [],
+    "icloud_default_calendar_id": "",
+    "todolist_visible": true,
+    "todolist_x": 345,
+    "todolist_y": 165,
+    "todolist_w": 300,
+    "todolist_h": 320,
+    "todolist_docked": true,
+    "todolist_dock_side": "bottom",
+    "todolist_dock_offset": 265
   }
 }

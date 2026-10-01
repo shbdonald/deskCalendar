@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
-"""config.json = defaults + session.
+"""App config vs user data.
 
-  defaults — editable factory defaults (seeded from layout_metrics + theme)
-  session  — last exit state; empty {} → load uses defaults
+  data/config.json      — factory defaults only (safe to ship / commit)
+  userdata/session.json — last exit state (personal; never ship)
+  userdata/*            — todos, credentials, calendar cache
 """
 from __future__ import annotations
 
@@ -28,9 +29,18 @@ from app.services.layout_metrics import (
 from app.services.theme import DEFAULT_THEME
 from app.services.winamp_dock import DockState, apply_dock
 
+# Files that belong under userdata/ (never packaged with releases).
+USER_DATA_FILES: tuple[str, ...] = (
+    "session.json",
+    "todos.json",
+    "todolist.json",
+    "icloud_caldav.json",
+    "icloud_calendars.json",
+)
+
 
 def project_root() -> Path:
-    """Project / portable install root (contains data/)."""
+    """Project / portable install root (contains data/ and userdata/)."""
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parents[2]
@@ -43,16 +53,37 @@ def _legacy_appdata_dir() -> Path | None:
     return None
 
 
-def _migrate_from_appdata_if_needed(base: Path) -> None:
+def _atomic_write_json(path: Path, document: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(document, ensure_ascii=False, indent=2)
+    fd, tmp_name = tempfile.mkstemp(prefix=path.stem + "_", suffix=".json", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_name, path)
+    except OSError:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        path.write_text(payload, encoding="utf-8")
+
+
+def _migrate_from_appdata_if_needed(data_base: Path, user_base: Path) -> None:
     legacy = _legacy_appdata_dir()
-    if legacy is None or not legacy.is_dir() or (base / "config.json").exists():
+    if legacy is None or not legacy.is_dir():
         return
     try:
-        for name in ("config.json", "todos.json"):
-            src, dst = legacy / name, base / name
+        src_cfg, dst_cfg = legacy / "config.json", data_base / "config.json"
+        if src_cfg.is_file() and not dst_cfg.exists() and not (user_base / "session.json").exists():
+            shutil.copy2(src_cfg, dst_cfg)
+        for name in ("todos.json",):
+            src, dst = legacy / name, user_base / name
             if src.is_file() and not dst.exists():
                 shutil.copy2(src, dst)
-        leg_hol, loc_hol = legacy / "holidays", base / "holidays"
+        leg_hol, loc_hol = legacy / "holidays", data_base / "holidays"
         if leg_hol.is_dir():
             loc_hol.mkdir(parents=True, exist_ok=True)
             for f in leg_hol.glob("*.json"):
@@ -63,11 +94,84 @@ def _migrate_from_appdata_if_needed(base: Path) -> None:
         pass
 
 
+def _migrate_userdata_from_data(data_base: Path, user_base: Path) -> None:
+    """Move legacy personal files out of data/ into userdata/."""
+    if not data_base.is_dir():
+        return
+    for name in USER_DATA_FILES:
+        if name == "session.json":
+            continue
+        src, dst = data_base / name, user_base / name
+        if not src.is_file():
+            continue
+        if not dst.exists():
+            try:
+                shutil.move(str(src), str(dst))
+            except OSError:
+                try:
+                    shutil.copy2(src, dst)
+                    src.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        else:
+            try:
+                src.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    cfg_path = data_base / "config.json"
+    session_path = user_base / "session.json"
+    if not cfg_path.is_file():
+        return
+    try:
+        raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return
+    if not isinstance(raw, dict):
+        return
+
+    if not session_path.exists():
+        session_raw = None
+        if "defaults" in raw or "session" in raw:
+            session_raw = raw.get("session")
+        else:
+            session_raw = raw
+        if isinstance(session_raw, dict) and session_raw:
+            try:
+                _atomic_write_json(session_path, _normalize_state(session_raw))
+            except OSError:
+                pass
+
+    if "defaults" in raw or "session" in raw:
+        defaults = raw.get("defaults") if isinstance(raw.get("defaults"), dict) else {}
+        try:
+            _atomic_write_json(cfg_path, {"defaults": defaults})
+        except OSError:
+            pass
+    elif session_path.exists():
+        try:
+            _atomic_write_json(cfg_path, {"defaults": deepcopy(FACTORY_DEFAULTS)})
+        except OSError:
+            pass
+
+
 def app_data_dir() -> Path:
+    """Shippable app data (defaults, holiday cache)."""
     base = project_root() / "data"
     base.mkdir(parents=True, exist_ok=True)
     (base / "holidays").mkdir(exist_ok=True)
-    _migrate_from_appdata_if_needed(base)
+    user_base = project_root() / "userdata"
+    user_base.mkdir(parents=True, exist_ok=True)
+    _migrate_from_appdata_if_needed(base, user_base)
+    _migrate_userdata_from_data(base, user_base)
+    return base
+
+
+def user_data_dir() -> Path:
+    """Personal runtime data — never commit or pack into releases."""
+    app_data_dir()
+    base = project_root() / "userdata"
+    base.mkdir(parents=True, exist_ok=True)
     return base
 
 
@@ -239,56 +343,47 @@ def _migrate_flat_legacy(raw: dict[str, Any]) -> dict[str, Any]:
 class ConfigStore:
     def __init__(self) -> None:
         self.path = app_data_dir() / "config.json"
+        self.session_path = user_data_dir() / "session.json"
         self.defaults: dict[str, Any] = deepcopy(FACTORY_DEFAULTS)
         self.session: dict[str, Any] = {}
         self.load()
 
     def load(self) -> None:
-        if not self.path.exists():
-            self.defaults = deepcopy(FACTORY_DEFAULTS)
-            self.session = {}
-            self.save()
-            return
-        try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
-            if not isinstance(raw, dict):
-                raise ValueError("config root must be object")
-            if "defaults" in raw or "session" in raw:
-                self.defaults = _backfill_geometry(
-                    {**deepcopy(FACTORY_DEFAULTS), **_normalize_state(raw.get("defaults"))}
-                )
-                self.session = _normalize_state(raw.get("session"))
-                if self.session:
-                    self.session = _backfill_geometry(self.session)
-            else:
-                self.defaults = deepcopy(FACTORY_DEFAULTS)
-                self.session = _migrate_flat_legacy(raw)
-            self.save()
-        except (json.JSONDecodeError, OSError, TypeError, ValueError):
-            self.defaults = deepcopy(FACTORY_DEFAULTS)
-            self.session = {}
-            self.save()
+        self.defaults = deepcopy(FACTORY_DEFAULTS)
+        self.session = {}
+        if self.path.exists():
+            try:
+                raw = json.loads(self.path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    if "defaults" in raw or "session" in raw:
+                        self.defaults = _backfill_geometry(
+                            {**deepcopy(FACTORY_DEFAULTS), **_normalize_state(raw.get("defaults"))}
+                        )
+                        # Legacy combined file: session may still be inline until migration rewrote it
+                        inline = _normalize_state(raw.get("session"))
+                        if inline and not self.session_path.exists():
+                            self.session = _backfill_geometry(inline)
+                    else:
+                        # Flat legacy treated as session; defaults stay factory
+                        if not self.session_path.exists():
+                            self.session = _migrate_flat_legacy(raw)
+            except (json.JSONDecodeError, OSError, TypeError, ValueError):
+                pass
+
+        if self.session_path.exists():
+            try:
+                raw_s = json.loads(self.session_path.read_text(encoding="utf-8"))
+                if isinstance(raw_s, dict):
+                    self.session = _backfill_geometry(_normalize_state(raw_s))
+            except (json.JSONDecodeError, OSError, TypeError, ValueError):
+                pass
+
+        self.save()
 
     def save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        document = {
-            "defaults": self.defaults,
-            "session": {} if _session_is_empty(self.session) else self.session,
-        }
-        payload = json.dumps(document, ensure_ascii=False, indent=2)
-        fd, tmp_name = tempfile.mkstemp(prefix="config_", suffix=".json", dir=str(self.path.parent))
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.write(payload)
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(tmp_name, self.path)
-        except OSError:
-            try:
-                os.unlink(tmp_name)
-            except OSError:
-                pass
-            self.path.write_text(payload, encoding="utf-8")
+        _atomic_write_json(self.path, {"defaults": self.defaults})
+        session_doc = {} if _session_is_empty(self.session) else self.session
+        _atomic_write_json(self.session_path, session_doc)
 
     def get(self, key: str, default: Any = None) -> Any:
         if not _session_is_empty(self.session) and key in self.session:

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Window/cell size math for resize and expand — not for cold-start load.
 
-Cold start restores x/y/display_w/h from data/config.json.
+Cold start restores x/y/display_w/h from userdata/session.json (else defaults).
 This module seeds FACTORY_DEFAULTS and converts cell ↔ window when resizing
 or toggling week/month views.
 """

@@ -7,7 +7,7 @@ from datetime import date, datetime, timezone
 from typing import Any
 
 from .calendar_math import date_key
-from .config_store import app_data_dir
+from .config_store import user_data_dir
 
 REPEAT_NONE = "none"
 REPEAT_DAILY = "daily"
@@ -103,7 +103,7 @@ class TodoStore:
     """Plans with optional recurrence; file kept as todos.json for compatibility."""
 
     def __init__(self) -> None:
-        self.path = app_data_dir() / "todos.json"
+        self.path = user_data_dir() / "todos.json"
         self._plans: list[dict[str, Any]] = []
         self.load()
 

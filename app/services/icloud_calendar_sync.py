@@ -10,7 +10,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from .calendar_math import date_key
-from .config_store import app_data_dir
+from .config_store import user_data_dir
 from .todo_store import (
     REPEAT_DAILY,
     REPEAT_MONTHLY,
@@ -191,10 +191,10 @@ class ICloudCalendarSync:
         self._push_guard_seconds = 8.0
 
     def credentials_path(self):
-        return app_data_dir() / CREDENTIALS_FILE
+        return user_data_dir() / CREDENTIALS_FILE
 
     def calendars_cache_path(self):
-        return app_data_dir() / CALENDARS_CACHE_FILE
+        return user_data_dir() / CALENDARS_CACHE_FILE
 
     def load_credentials(self) -> dict[str, str]:
         path = self.credentials_path()

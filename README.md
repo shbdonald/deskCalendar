@@ -1,7 +1,7 @@
 # 桌面日历（Desktop Calendar）
 
 Windows 桌面日历小组件，基于 **Python + PySide6**。  
-默认显示本周（周日→周六），可展开为本月；格内显示计划与多国节假日。窗口置底、可锁定，配置保存在项目 `data/` 目录。
+默认显示本周（周日→周六），可展开为本月；格内显示计划与多国节假日。窗口置底、可锁定；出厂配置在 `data/`，个人数据在 `userdata/`。
 
 回滚到加「重复计划」之前的版本：
 
@@ -62,7 +62,7 @@ pyinstaller -F -w -n DesktopCalendar main.py
 
 | 逻辑 | 说明 | 关键名 |
 |------|------|--------|
-| 存储 | 扁平 `plans` 列表（启动时自动迁移旧按日键格式） | `todos.json`；`TodoStore` |
+| 存储 | 扁平 `plans` 列表（启动时自动迁移旧按日键格式） | `userdata/todos.json`；`TodoStore` |
 | 项结构 | `title` / `detail`（系列）/ `occurrence_details`（按日备注）/ … | 完成时可写当日情况；同步进日历 DESCRIPTION |
 | 展开 | `for_date(d)` 按重复规则投影到日历格 | `occurs_on` |
 | 同步方向 | 比较 `updated_at` 与远端 `LAST-MODIFIED` / `X-DESKTOPCAL-UPDATED`；手机删除且本地未再改 → 跟删；本地更新过 → 再推 | `plan_needs_push`、`reconcile_with_remotes` |
@@ -79,7 +79,7 @@ iCloud 里的「个人 / 工作 / 租房」等就是**日历**；本应用把它
 | 协议 | CalDAV，事件为全天 VEVENT（可含 RRULE） |
 | 多日历 | 设置中「刷新列表」后多选要同步的日历；可「新建日历」 |
 | 默认日历 | 「新建计划默认」下拉；计划也可单独选日历 |
-| 凭证 | Apple ID + [应用专用密码](https://appleid.apple.com)，保存在 `data/icloud_caldav.json`（不入库） |
+| 凭证 | Apple ID + [应用专用密码](https://appleid.apple.com)，保存在 `userdata/icloud_caldav.json`（不入库） |
 | 推送 | 本地新增/编辑/删除/打卡后异步写入所属日历 |
 | 拉取 | 对每个已启用日历轮询对账（默认 45 秒） |
 | 生日等 | 通讯录系统「生日」日历（URL 含 birthday）不列出；**你自建的同名日历会列出并同步** |
@@ -209,15 +209,28 @@ iPhone：系统设置 → 日历 → 账户 → iCloud，确保日历开关打�
 ## 数据目录
 
 ```
-desktopcalendar/data/
-  config.json      # defaults + session
-  todos.json       # 计划（含重复与 caldav_uid）
-  icloud_caldav.json  # iCloud 凭证（本地，勿分享）
-  icloud_calendars.json  # 日历列表缓存（本地）
-  holidays/        # 各国节假日缓存 CC_YEAR.json
+desktopcalendar/
+  data/                         # 可随版本发布
+    config.json                 # 仅 defaults（出厂默认）
+    holidays/                   # 各国节假日缓存 CC_YEAR.json
+    countries.json              # 国家名缓存
+  userdata/                     # 个人数据（勿提交 / 勿打包进发行版）
+    session.json                # 上次退出状态（窗口、iCloud 选项等）
+    todos.json                  # 计划（含重复与 caldav_uid）
+    todolist.json               # 今日待办窗口附属数据
+    icloud_caldav.json          # iCloud 凭证
+    icloud_calendars.json       # 日历列表缓存
 ```
 
-若曾使用 `%APPDATA%\DesktopCalendar\`，首次启动会迁移到 `data/`。
+旧版把 session / todos / 凭证放在 `data/` 时，启动会自动迁到 `userdata/`，并把 `config.json` 收成仅 `defaults`。  
+若曾使用 `%APPDATA%\DesktopCalendar\`，首次启动也会迁入上述目录。
+
+发版前清理个人数据：
+
+```bash
+python clean_userdata.py          # 清空 userdata/，并保证 data/config 无 session
+python build_portable.py          # 便携包不包含 userdata 内容
+```
 
 ---
 
@@ -227,13 +240,16 @@ desktopcalendar/data/
 desktopcalendar/
   main.py                      # QApplication 入口（QuitOnLastWindowClosed=False）
   requirements.txt
-  data/                        # 运行时数据（自动生成）
+  build_portable.py            # 绿色版 zip（不含用户数据）
+  clean_userdata.py            # 发版前清空 userdata
+  data/                        # 出厂配置与节假日缓存
+  userdata/                    # 个人数据（gitignore）
   app/
     main_window.py             # 主窗：几何、锁定、托盘、置底、设置联动
     services/
       calendar_math.py         # 周日周起点、月 6 行网格
       layout_metrics.py        # 格↔窗尺寸公式与 MIN_*
-      config_store.py          # defaults/session 读写
+      config_store.py          # defaults（data）+ session（userdata）
       theme.py                 # 默认色 + 配色方案
       todo_store.py            # 计划持久化与重复展开
       todo_list_store.py       # 独立待办清单
@@ -252,11 +268,11 @@ desktopcalendar/
 | 类 / 模块 | 职责 |
 |-----------|------|
 | `MainWindow` | UI 壳、事件过滤缩放、配置落盘、置底 |
-| `ConfigStore` | `get`/`set`/`load`/`save`；session 优先 |
+| `ConfigStore` | `get`/`set`/`load`/`save`；session 优先于 defaults |
 | `HolidayService` | `ensure_years`、`holidays_for`、`set_countries` |
 | `TodoStore` | 计划 CRUD、重复展开、`toggle` 按日完成 |
 | `TodoListStore` / `TodoListWindow` | 今日计划操作台（投影当日计划、打卡与删当日） |
 | `ICloudCalendarSync` | CalDAV 连接、VEVENT 推送/拉取对账 |
 | `SettingsDialog` | 国家、配色、透明度、iCloud 同步 |
 
-改默认外观或首次几何：编辑 `data/config.json` 的 **`defaults`**；清空 **`session`** 即可下次用默认启动。
+改默认外观或首次几何：编辑 `data/config.json` 的 **`defaults`**；删除 `userdata/session.json` 即可下次用默认启动。

@@ -8,5 +8,11 @@ release/
 *.spec
 .idea/
 .vscode/
+
+# Personal runtime data (never commit)
+userdata/
+data/todos.json
+data/todolist.json
 data/icloud_caldav.json
 data/icloud_calendars.json
+data/session.json

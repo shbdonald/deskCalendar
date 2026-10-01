@@ -8,7 +8,7 @@ from datetime import date, datetime, timezone
 from typing import Any
 
 from .calendar_math import date_key
-from .config_store import app_data_dir
+from .config_store import user_data_dir
 
 STORE_FILE = "todolist.json"
 
@@ -19,7 +19,7 @@ def utc_now_iso() -> str:
 
 class TodoListStore:
     def __init__(self) -> None:
-        self._path = app_data_dir() / STORE_FILE
+        self._path = user_data_dir() / STORE_FILE
         self._items: list[dict[str, Any]] = []
         self.load()
 
