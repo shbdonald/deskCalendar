@@ -15,7 +15,7 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QSize
+from PySide6.QtCore import QRect, QSize
 
 from app.services.layout_metrics import (
     MIN_WEEK,
@@ -26,6 +26,7 @@ from app.services.layout_metrics import (
     week_window_size,
 )
 from app.services.theme import DEFAULT_THEME
+from app.services.winamp_dock import DockState, apply_dock
 
 
 def project_root() -> Path:
@@ -73,6 +74,36 @@ def app_data_dir() -> Path:
 _size = default_week_window()
 _dw, _dh = _size.width(), _size.height()
 _dcw, _dch = MIN_WEEK
+_EDGE_MARGIN = 5
+
+
+def top_right_origin(width: int, height: int, *, margin: int = _EDGE_MARGIN) -> tuple[int, int]:
+    """默认态：贴屏幕可用区右上角，上/右各留 margin 像素。"""
+    try:
+        from PySide6.QtGui import QGuiApplication
+
+        screen = QGuiApplication.primaryScreen()
+        if screen is not None:
+            g = screen.availableGeometry()
+            x = int(g.x() + g.width() - width - margin)
+            y = int(g.y() + margin)
+            return x, y
+    except Exception:  # noqa: BLE001
+        pass
+    return 80, margin
+
+
+_ox, _oy = top_right_origin(_dw, _dh)
+
+# 今日待办：默认贴日历下方右侧对齐，可自由缩放（不强制与日历同宽）
+_TW = 300
+_TH = 320
+_todo_off = max(0, _dw - _TW)
+_todo_geo = apply_dock(
+    QRect(_ox, _oy, _dw, _dh),
+    (_TW, _TH),
+    DockState("bottom", _todo_off),
+)
 
 STATE_KEYS: tuple[str, ...] = (
     "x",
@@ -88,11 +119,25 @@ STATE_KEYS: tuple[str, ...] = (
     "cell_w",
     "cell_h",
     "theme",
+    "icloud_sync_enabled",
+    "icloud_calendar_name",
+    "icloud_poll_seconds",
+    "icloud_calendars_enabled",
+    "icloud_calendars_enabled_names",
+    "icloud_default_calendar_id",
+    "todolist_visible",
+    "todolist_x",
+    "todolist_y",
+    "todolist_w",
+    "todolist_h",
+    "todolist_docked",
+    "todolist_dock_side",
+    "todolist_dock_offset",
 )
 
 FACTORY_DEFAULTS: dict[str, Any] = {
-    "x": 80,
-    "y": 80,
+    "x": _ox,
+    "y": _oy,
     "countries": ["CN"],
     "expanded": False,
     "opacity": 0.92,
@@ -104,6 +149,20 @@ FACTORY_DEFAULTS: dict[str, Any] = {
     "cell_w": _dcw,
     "cell_h": _dch,
     "theme": dict(DEFAULT_THEME),
+    "icloud_sync_enabled": False,
+    "icloud_calendar_name": "桌面计划",
+    "icloud_poll_seconds": 45,
+    "icloud_calendars_enabled": [],
+    "icloud_calendars_enabled_names": [],
+    "icloud_default_calendar_id": "",
+    "todolist_visible": True,
+    "todolist_x": int(_todo_geo.x()),
+    "todolist_y": int(_todo_geo.y()),
+    "todolist_w": _TW,
+    "todolist_h": _TH,
+    "todolist_docked": True,
+    "todolist_dock_side": "bottom",
+    "todolist_dock_offset": _todo_off,
 }
 
 
@@ -120,6 +179,12 @@ def _normalize_state(raw: dict[str, Any] | None) -> dict[str, Any]:
         elif key == "countries":
             if isinstance(val, list):
                 out[key] = [str(c).upper() for c in val if c]
+        elif key == "icloud_calendars_enabled":
+            if isinstance(val, list):
+                out[key] = [str(c) for c in val if c]
+        elif key == "icloud_calendars_enabled_names":
+            if isinstance(val, list):
+                out[key] = [str(c) for c in val if c]
         else:
             out[key] = val
     return out

@@ -8,3 +8,5 @@ release/
 *.spec
 .idea/
 .vscode/
+data/icloud_caldav.json
+data/icloud_calendars.json

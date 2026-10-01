@@ -10,8 +10,8 @@ from __future__ import annotations
 from PySide6.QtCore import QSize
 
 # Keep in sync with DayCell.setMinimumSize usage.
-MIN_WEEK = (75, 64)
-MIN_MONTH = (75, 64)
+MIN_WEEK = (75, 105)
+MIN_MONTH = (75, 105)
 
 # Must match MainWindow / WeekView / MonthView layout constants.
 MARGIN = 8

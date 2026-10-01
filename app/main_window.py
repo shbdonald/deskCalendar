@@ -3,22 +3,26 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
-from PySide6.QtCore import QEvent, QPoint, QRect, QSize, Qt, QTimer
+from PySide6.QtCore import QEvent, QPoint, QRect, QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import (
     QAction,
     QCloseEvent,
     QColor,
     QContextMenuEvent,
     QCursor,
+    QFont,
+    QFontDatabase,
     QGuiApplication,
     QIcon,
     QMouseEvent,
     QPainter,
+    QPainterPath,
     QPixmap,
 )
 from PySide6.QtWidgets import (
     QApplication,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QMainWindow,
     QMenu,
@@ -46,10 +50,26 @@ from app.services.layout_metrics import (
     window_width_for_cell_width,
 )
 from app.services.theme import merge_theme
-from app.services.todo_store import TodoStore
+from app.services.todo_store import REPEAT_NONE, TodoStore, plan_needs_push
+from app.services.winamp_dock import (
+    SNAP,
+    DockState,
+    apply_dock,
+    capture_offset,
+    docked_drag_step,
+    should_break,
+    try_snap,
+)
+from app.services.icloud_calendar_sync import DEFAULT_CALENDAR_NAME, ICloudCalendarSync
 from app.widgets.month_view import MonthView
 from app.widgets.settings_dialog import SettingsDialog
-from app.widgets.todo_dialog import TodoEditDialog
+from app.widgets.todo_dialog import (
+    DELETE_OCCURRENCE,
+    NOTE_MODE_DAY,
+    NOTE_MODE_SERIES,
+    TodoEditDialog,
+)
+from app.widgets.todo_list_window import TodoListWindow
 from app.widgets.week_view import WeekView
 
 # Chrome icons (flat unicode)
@@ -57,11 +77,73 @@ _ICON_EXPAND = "▼"
 _ICON_COLLAPSE = "▲"
 _ICON_LOCKED = "🔒"
 _ICON_UNLOCKED = "🔓"
+_ICON_SYNC = "🔄"
 _ICON_SETTINGS = "⚙"
-_ICON_PREV = "‹"
-_ICON_NEXT = "›"
 _ICON_MIN = "–"
 _ICON_CLOSE = "✕"
+
+# Windows / Edge 浏览器工具栏返回键字形（Segoe MDL2 / Fluent Icons）
+_CHROME_BACK = "\uE0A6"
+_SEGOE_ICON_FONTS = ("Segoe Fluent Icons", "Segoe MDL2 Assets")
+
+
+def _segoe_icon_font(pixel_size: int) -> QFont | None:
+    families = set(QFontDatabase.families())
+    for name in _SEGOE_ICON_FONTS:
+        if name in families:
+            font = QFont(name)
+            font.setPixelSize(pixel_size)
+            return font
+    return None
+
+
+def _browser_nav_icon(*, forward: bool, color: str, size: int = 32) -> QIcon:
+    """绘制与 Windows 常用浏览器一致的前进/后退图标。"""
+    pm = QPixmap(size, size)
+    pm.fill(QColor(0, 0, 0, 0))
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+    col = QColor(color)
+    font = _segoe_icon_font(max(14, size // 2))
+    if font is not None:
+        # ChromeBack；前进 = 水平镜像，与 Edge 工具栏一致
+        if forward:
+            p.translate(size, 0)
+            p.scale(-1.0, 1.0)
+        p.setFont(font)
+        p.setPen(col)
+        p.drawText(
+            0,
+            0,
+            size,
+            size,
+            int(Qt.AlignmentFlag.AlignCenter),
+            _CHROME_BACK,
+        )
+    else:
+        # 无 Segoe 字体时：画浏览器风格带杆箭头
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(col)
+        s = float(size)
+        path = QPainterPath()
+        # 箭头头部（朝左）+ 水平杆
+        path.moveTo(s * 0.42, s * 0.22)
+        path.lineTo(s * 0.18, s * 0.50)
+        path.lineTo(s * 0.42, s * 0.78)
+        path.lineTo(s * 0.42, s * 0.62)
+        path.lineTo(s * 0.78, s * 0.62)
+        path.lineTo(s * 0.78, s * 0.38)
+        path.lineTo(s * 0.42, s * 0.38)
+        path.closeSubpath()
+        if forward:
+            p.translate(size, 0)
+            p.scale(-1.0, 1.0)
+        p.drawPath(path)
+    p.end()
+    icon = QIcon()
+    icon.addPixmap(pm)
+    return icon
 
 
 # Bit flags for frameless edge resize
@@ -87,6 +169,24 @@ def _tray_icon() -> QIcon:
     return QIcon(pm)
 
 
+class _ICloudJob(QThread):
+    """在后台线程执行 iCloud 同步，避免卡住界面。"""
+
+    finished_ok = Signal(object)
+    finished_err = Signal(str)
+
+    def __init__(self, fn, parent=None) -> None:  # noqa: ANN001
+        super().__init__(parent)
+        self._fn = fn
+
+    def run(self) -> None:
+        try:
+            result = self._fn()
+            self.finished_ok.emit(result)
+        except Exception as exc:  # noqa: BLE001
+            self.finished_err.emit(str(exc))
+
+
 class MainWindow(QMainWindow):
     MIN_BASE = default_week_window()
     MIN_MONTH = default_month_window()
@@ -95,6 +195,20 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.config = ConfigStore()
         self.todos = TodoStore()
+        self.icloud = ICloudCalendarSync()
+        self._icloud_jobs: list[_ICloudJob] = []
+        self._todolist_syncing_vis = False
+        self._todo_docked = bool(self.config.get("todolist_docked", True))
+        side = str(self.config.get("todolist_dock_side", "bottom") or "bottom")
+        if side not in ("bottom", "top", "left", "right"):
+            side = "bottom"
+        try:
+            dock_off = int(self.config.get("todolist_dock_offset", 0) or 0)
+        except (TypeError, ValueError):
+            dock_off = 0
+        self._todo_dock = DockState(side=side, offset=dock_off)
+        self._todo_group_guard = False
+        self._todo_drag_last: QPoint | None = None
         self.holidays = HolidayService(self)
         self.holidays.updated.connect(self.refresh_views)
 
@@ -130,12 +244,10 @@ class MainWindow(QMainWindow):
         self.week_view = WeekView()
         self.month_view = MonthView()
         self.week_view.bind(
-            on_toggle=self._on_todo_toggle,
             on_edit=self._on_todo_edit,
             on_add=self._on_day_add,
         )
         self.month_view.bind(
-            on_toggle=self._on_todo_toggle,
             on_edit=self._on_todo_edit,
             on_add=self._on_day_add,
         )
@@ -170,6 +282,533 @@ class MainWindow(QMainWindow):
         self._clock.timeout.connect(self._on_clock)
         self._clock.start()
 
+        self._icloud_timer = QTimer(self)
+        self._icloud_timer.timeout.connect(self._icloud_poll)
+        self._reload_icloud_timer()
+
+        self._init_todolist_window()
+
+    def _init_todolist_window(self) -> None:
+        # 副窗口：以日历为主窗 owner，跟随主窗生命周期
+        self.todo_list_win = TodoListWindow(self)
+        self.todo_list_win.apply_theme(self._theme)
+        self.todo_list_win.setWindowOpacity(float(self.windowOpacity()))
+        self.todo_list_win.set_interactive(not self._size_locked)
+        self.todo_list_win.set_items(self._todos_for_date(date.today()))
+        self.todo_list_win.add_requested.connect(self._on_todolist_add)
+        self.todo_list_win.done_changed.connect(self._on_todolist_done)
+        self.todo_list_win.title_changed.connect(self._on_todolist_title)
+        self.todo_list_win.delete_requested.connect(self._on_todolist_delete)
+        self.todo_list_win.edit_requested.connect(self._on_todolist_edit)
+        self.todo_list_win.visibility_changed.connect(self._on_todolist_visibility)
+        self.todo_list_win.geometry_changed.connect(self._persist_todolist_geometry)
+        self.todo_list_win.geometry_moving.connect(self._on_todolist_moving)
+        self.todo_list_win.undock_requested.connect(self._undock_todolist)
+        self._place_todolist(force_dock=self._size_locked or self._todo_docked)
+        if bool(self.config.get("todolist_visible", True)):
+            self._set_todolist_visible(True, persist=False)
+
+    def _todolist_size(self) -> tuple[int, int]:
+        try:
+            w = int(self.config.get("todolist_w", 0))
+        except (TypeError, ValueError):
+            w = 0
+        try:
+            h = int(self.config.get("todolist_h", 0))
+        except (TypeError, ValueError):
+            h = 0
+        if w < 240:
+            w = max(240, int(self.width()) if self.width() >= 240 else 300)
+        if h < 280:
+            h = 320
+        return w, h
+
+    def _calendar_screen_rect(self) -> QRect:
+        origin = self.mapToGlobal(QPoint(0, 0))
+        return QRect(origin.x(), origin.y(), int(self.width()), int(self.height()))
+
+    def _default_bottom_dock(self) -> DockState:
+        """默认贴日历正下方、右对齐。"""
+        cal = self._calendar_screen_rect()
+        w, _h = self._todolist_size()
+        return DockState("bottom", max(0, cal.width() - w))
+
+    def _clamp_todo_dock_offset(self, *, size: tuple[int, int] | None = None) -> None:
+        """避免旧偏移把待办推出屏幕 / 日历右缘。"""
+        cal = self._calendar_screen_rect()
+        w, h = size if size is not None else self._todolist_size()
+        side = self._todo_dock.side
+        off = int(self._todo_dock.offset)
+        if side in ("bottom", "top"):
+            max_off = max(0, cal.width() - w)
+            off = min(max(0, off), max_off)
+        elif side in ("left", "right"):
+            max_off = max(0, cal.height() - h)
+            off = min(max(0, off), max_off)
+        self._todo_dock.offset = off
+
+    def _apply_todo_dock(self, *, size: tuple[int, int] | None = None) -> None:
+        if not hasattr(self, "todo_list_win"):
+            return
+        if not (self._todo_docked or self._size_locked):
+            return
+        w, h = size if size is not None else self._todolist_size()
+        w, h = max(240, int(w)), max(280, int(h))
+        self._clamp_todo_dock_offset(size=(w, h))
+        cal = self._calendar_screen_rect()
+        geo = apply_dock(cal, (w, h), self._todo_dock)
+        screen = QGuiApplication.screenAt(geo.center()) or QGuiApplication.primaryScreen()
+        if screen is not None:
+            avail = screen.availableGeometry()
+            x = min(max(avail.x(), geo.x()), avail.x() + max(0, avail.width() - geo.width()))
+            y = min(max(avail.y(), geo.y()), avail.y() + max(0, avail.height() - geo.height()))
+            geo = QRect(x, y, geo.width(), geo.height())
+        self._todo_group_guard = True
+        try:
+            self.todo_list_win.setGeometry(geo)
+        finally:
+            self._todo_group_guard = False
+        self.todo_list_win.setWindowOpacity(float(self.windowOpacity()))
+        # 解锁且贴合时：拖动走「仅主窗算几何」路径，避免抖动
+        self.todo_list_win.set_dock_slide(bool(self._todo_docked and not self._size_locked))
+
+    def _place_todolist(self, *, force_dock: bool = False) -> None:
+        if not hasattr(self, "todo_list_win"):
+            return
+        self.todo_list_win.setWindowOpacity(float(self.windowOpacity()))
+        w, h = self._todolist_size()
+        if force_dock or self._size_locked:
+            if not self._todo_docked:
+                self._todo_docked = True
+                self._todo_dock = self._default_bottom_dock()
+            self._apply_todo_dock(size=(w, h))
+            return
+        if self._todo_docked:
+            self._apply_todo_dock(size=(w, h))
+            return
+        try:
+            x = int(self.config.get("todolist_x", 80))
+            y = int(self.config.get("todolist_y", 80))
+        except (TypeError, ValueError):
+            x, y = 80, 80
+        self.todo_list_win.setGeometry(x, y, w, h)
+
+    def _dock_todolist(self) -> None:
+        if not hasattr(self, "todo_list_win"):
+            return
+        self.todo_list_win.setWindowOpacity(float(self.windowOpacity()))
+        if self._size_locked:
+            self._todo_docked = True
+            if self._todo_dock.side not in ("bottom", "top", "left", "right"):
+                self._todo_dock = self._default_bottom_dock()
+            self._apply_todo_dock()
+        elif self._todo_docked:
+            self._apply_todo_dock()
+
+    def _remember_todo_dock(self, state: DockState) -> None:
+        self._todo_docked = True
+        self._todo_dock = state
+        if hasattr(self, "todo_list_win"):
+            self.todo_list_win.set_dock_slide(True)
+        self.config.set('todolist_docked', True, persist=False)
+        self.config.set('todolist_dock_side', state.side, persist=False)
+        self.config.set('todolist_dock_offset', int(state.offset), persist=False)
+
+    def _undock_todolist(self) -> None:
+        if self._size_locked:
+            return
+        self._todo_docked = False
+        self._todo_drag_last = None
+        if hasattr(self, "todo_list_win"):
+            self.todo_list_win.set_dock_slide(False)
+        self.config.set('todolist_docked', False, persist=False)
+        self.config.save()
+
+    def _on_todolist_moving(self, mode: str) -> None:
+        """副窗移动/缩放；主窗（日历）永不被副窗拖走。"""
+        if self._todo_group_guard or not hasattr(self, "todo_list_win"):
+            return
+        cal = self._calendar_screen_rect()
+        todo = self.todo_list_win.geometry()
+        cursor = QCursor.pos()
+
+        if mode == "drag" and self._todo_docked and not self._size_locked:
+            grab = self.todo_list_win.drag_grab()
+            if grab is None:
+                return
+            proposed = cursor - grab
+            st, geo = docked_drag_step(
+                cal, (todo.width(), todo.height()), self._todo_dock, proposed
+            )
+            if st is None:
+                # 拉开：放到自由位置，退出贴合滑动
+                self._todo_docked = False
+                self.todo_list_win.set_dock_slide(False)
+                self._todo_drag_last = QPoint(geo.x(), geo.y())
+                self._todo_group_guard = True
+                try:
+                    self.todo_list_win.setGeometry(geo)
+                finally:
+                    self._todo_group_guard = False
+                self.todo_list_win.resync_drag_grab(cursor)
+                return
+            self._remember_todo_dock(st)
+            self._todo_group_guard = True
+            try:
+                self.todo_list_win.setGeometry(geo)
+            finally:
+                self._todo_group_guard = False
+            return
+
+        if mode == "drag":
+            # 未贴合：自由移动，靠近日历则吸上
+            self._todo_drag_last = QPoint(todo.x(), todo.y())
+            state = try_snap(cal, todo)
+            if state is not None:
+                self._remember_todo_dock(state)
+                self._apply_todo_dock(size=(todo.width(), todo.height()))
+                self.todo_list_win.resync_drag_grab(cursor)
+            return
+
+        # resize：贴合时保留用户拖出的宽高，只更新偏移再贴回
+        if self._todo_docked:
+            if should_break(cal, todo, self._todo_dock):
+                self._todo_docked = False
+                self.todo_list_win.set_dock_slide(False)
+            else:
+                self._todo_dock.offset = capture_offset(cal, todo, self._todo_dock.side)
+                self._apply_todo_dock(size=(todo.width(), todo.height()))
+                return
+        state = try_snap(cal, todo)
+        if state is not None:
+            self._remember_todo_dock(state)
+            self._apply_todo_dock(size=(todo.width(), todo.height()))
+
+    def _persist_todolist_geometry(self) -> None:
+        if not hasattr(self, "todo_list_win"):
+            return
+        self._todo_drag_last = None
+        geo = self.todo_list_win.geometry()
+        if geo.width() < 40 or geo.height() < 40:
+            return
+        # 松手时：若仍贴合，做一次左右/上下对齐吸附（拖动中不做，避免抖）
+        if self._todo_docked or self._size_locked:
+            cal = self._calendar_screen_rect()
+            side = self._todo_dock.side
+            if side in ("bottom", "top"):
+                x = geo.x()
+                if abs(geo.x() - cal.x()) <= SNAP:
+                    x = cal.x()
+                elif abs((geo.x() + geo.width()) - (cal.x() + cal.width())) <= SNAP:
+                    x = cal.x() + cal.width() - geo.width()
+                self._todo_dock.offset = x - cal.x()
+            else:
+                y = geo.y()
+                if abs(geo.y() - cal.y()) <= SNAP:
+                    y = cal.y()
+                elif abs((geo.y() + geo.height()) - (cal.y() + cal.height())) <= SNAP:
+                    y = cal.y() + cal.height() - geo.height()
+                self._todo_dock.offset = y - cal.y()
+            self._apply_todo_dock(size=(geo.width(), geo.height()))
+            geo = self.todo_list_win.geometry()
+        self.config.set("todolist_x", int(geo.x()), persist=False)
+        self.config.set("todolist_y", int(geo.y()), persist=False)
+        self.config.set("todolist_w", int(geo.width()), persist=False)
+        self.config.set("todolist_h", int(geo.height()), persist=False)
+        self.config.set("todolist_docked", bool(self._todo_docked), persist=False)
+        self.config.set("todolist_dock_side", self._todo_dock.side, persist=False)
+        self.config.set("todolist_dock_offset", int(self._todo_dock.offset), persist=False)
+        self.config.save()
+
+    def _set_todolist_visible(self, visible: bool, *, persist: bool = True) -> None:
+        # 锁定时不允许关闭今日待办
+        if not visible and self._size_locked:
+            visible = True
+        self._todolist_syncing_vis = True
+        try:
+            if visible:
+                self.todo_list_win.apply_theme(self._theme)
+                self.todo_list_win.set_items(self._todos_for_date(date.today()))
+                self._place_todolist(force_dock=self._size_locked or self._todo_docked)
+                self.todo_list_win.show()
+                self.todo_list_win.raise_()
+            else:
+                self.todo_list_win.force_hide()
+            if persist:
+                self.config.set("todolist_visible", bool(visible))
+                self.config.save()
+        finally:
+            self._todolist_syncing_vis = False
+
+    def _on_todolist_visibility(self, visible: bool) -> None:
+        if self._todolist_syncing_vis:
+            return
+        self.config.set("todolist_visible", bool(visible))
+        self.config.save()
+
+    def _refresh_todolist_ui(self) -> None:
+        if hasattr(self, "todo_list_win"):
+            self.todo_list_win.set_items(self._todos_for_date(date.today()))
+
+    def _on_todolist_add(self, title: str) -> None:
+        today = date.today()
+        default_id = self._icloud_default_calendar_id() or None
+        cals = self._enabled_calendars_for_ui()
+        default_name = None
+        if default_id:
+            for c in cals:
+                if c.get("id") == default_id:
+                    default_name = c.get("name")
+                    break
+        if not default_name and cals:
+            default_id = cals[0].get("id") or None
+            default_name = cals[0].get("name")
+        if not default_name:
+            default_name = self._icloud_calendar_name()
+        try:
+            plan = self.todos.add(
+                today,
+                title,
+                repeat=REPEAT_NONE,
+                calendar_id=default_id,
+                calendar_name=default_name,
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self.todo_list_win, "提示", str(exc))
+            return
+        self.refresh_views()
+        self._icloud_push_plan(plan["id"])
+
+    def _on_todolist_title(self, item_id: str, title: str) -> None:
+        plan = self.todos.get_plan(item_id)
+        if not plan:
+            self._refresh_todolist_ui()
+            return
+        try:
+            self.todos.update(
+                item_id,
+                title=title,
+                start=date.fromisoformat(str(plan["start"])),
+                repeat=str(plan.get("repeat") or REPEAT_NONE),
+                calendar_id=plan.get("calendar_id"),
+                calendar_name=plan.get("calendar_name"),
+            )
+        except (ValueError, KeyError) as exc:
+            QMessageBox.warning(self.todo_list_win, "提示", str(exc))
+            self._refresh_todolist_ui()
+            return
+        self.refresh_views()
+        self._icloud_push_plan(item_id)
+
+    def _on_todolist_edit(self, item_id: str) -> None:
+        self._on_todo_edit(date.today(), item_id)
+
+    def _on_todolist_delete(self, item_id: str) -> None:
+        """TodoList 删除：仅删今日（重复用 exceptions；单次整条删）。"""
+        today = date.today()
+        plan = self.todos.get_plan(item_id)
+        if not plan:
+            self._refresh_todolist_ui()
+            return
+        repeat = str(plan.get("repeat") or REPEAT_NONE)
+        if repeat == REPEAT_NONE:
+            uid = str(plan.get("caldav_uid") or "")
+            cal_id = str(plan.get("calendar_id") or "") or None
+            try:
+                self.todos.delete(item_id)
+            except KeyError:
+                return
+            if uid:
+                self._icloud_delete_uid(uid, calendar_id=cal_id)
+        else:
+            try:
+                self.todos.delete_occurrence(item_id, today)
+            except KeyError:
+                return
+            self._icloud_push_plan(item_id)
+        self.refresh_views()
+
+    def _ask_complete_note(
+        self,
+        title: str,
+        *,
+        recurring: bool,
+        parent=None,
+        initial: str = "",
+        series_note: str = "",
+    ) -> tuple[str, str, bool]:
+        """返回 (note_mode, text, ok)。取消时 ok=False。
+
+        周期计划：选「系列备注」预填系列备注；选「当日备注」清空备注栏。
+        """
+        from PySide6.QtWidgets import (
+            QDialog,
+            QDialogButtonBox,
+            QHBoxLayout,
+            QLabel,
+            QRadioButton,
+            QTextEdit,
+            QVBoxLayout,
+        )
+
+        dlg = QDialog(parent or self)
+        dlg.setWindowTitle("完成情况")
+        dlg.setMinimumWidth(360)
+        root = QVBoxLayout(dlg)
+        root.addWidget(QLabel(f"「{title}」"))
+
+        mode = NOTE_MODE_DAY
+        series_radio = None
+        day_radio = None
+        series_text = str(series_note or "").strip()
+        if recurring:
+            row = QHBoxLayout()
+            row.addWidget(QLabel("备注范围"))
+            series_radio = QRadioButton("系列备注")
+            day_radio = QRadioButton("当日备注")
+            day_radio.setChecked(True)
+            row.addWidget(series_radio)
+            row.addWidget(day_radio)
+            row.addStretch(1)
+            root.addLayout(row)
+            tip = QLabel(
+                "系列：写进整条计划，当日仅打卡。\n"
+                "当日：新建「今日单日」已完成任务，系列跳过今天。"
+            )
+            tip.setWordWrap(True)
+            root.addWidget(tip)
+        else:
+            root.addWidget(QLabel("当日备注（可选）"))
+
+        edit = QTextEdit()
+        edit.setAcceptRichText(False)
+        edit.setMinimumHeight(80)
+        if recurring:
+            edit.clear()  # 默认当日备注：空白
+        else:
+            edit.setPlainText(initial)
+        root.addWidget(edit)
+
+        if recurring and series_radio is not None and day_radio is not None:
+
+            def _on_series(checked: bool) -> None:
+                if checked:
+                    edit.setPlainText(series_text)
+
+            def _on_day(checked: bool) -> None:
+                if checked:
+                    edit.clear()
+
+            series_radio.toggled.connect(_on_series)
+            day_radio.toggled.connect(_on_day)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        root.addWidget(buttons)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return NOTE_MODE_DAY, "", False
+        if recurring and series_radio is not None and series_radio.isChecked():
+            mode = NOTE_MODE_SERIES
+        else:
+            mode = NOTE_MODE_DAY
+        return mode, edit.toPlainText().strip(), True
+
+    def _on_todolist_done(self, item_id: str, done: bool) -> None:
+        today = date.today()
+        item = next((t for t in self._todos_for_date(today) if t["id"] == item_id), None)
+        if not item:
+            self._refresh_todolist_ui()
+            return
+        if bool(item.get("done")) == bool(done):
+            return
+
+        if done:
+            plan = self.todos.get_plan(item_id)
+            if not plan:
+                return
+            repeat = str(plan.get("repeat") or REPEAT_NONE)
+            title = str(item.get("title") or "")
+            if repeat != REPEAT_NONE:
+                note_mode, text, ok = self._ask_complete_note(
+                    title,
+                    recurring=True,
+                    parent=self.todo_list_win,
+                    series_note=str(plan.get("detail") or ""),
+                )
+                if not ok:
+                    self._refresh_todolist_ui()
+                    return
+                if note_mode == NOTE_MODE_DAY:
+                    try:
+                        series_id, new_id = self.todos.complete_recurring_day_as_standalone(
+                            item_id, today, detail=text
+                        )
+                    except (KeyError, ValueError):
+                        self._refresh_todolist_ui()
+                        return
+                    self.refresh_views()
+                    self._icloud_push_plan(series_id)
+                    self._icloud_push_plan(new_id)
+                    return
+                # 系列备注：写进系列 detail，当日打卡，不拆单日
+                try:
+                    if text:
+                        self.todos.update(
+                            item_id,
+                            title=str(plan.get("title") or ""),
+                            start=date.fromisoformat(str(plan["start"])),
+                            repeat=repeat,
+                            calendar_id=plan.get("calendar_id"),
+                            calendar_name=plan.get("calendar_name"),
+                            detail=text,
+                        )
+                    self.todos.toggle(today, item_id)
+                except (KeyError, ValueError):
+                    self._refresh_todolist_ui()
+                    return
+                self.refresh_views()
+                self._icloud_push_plan(item_id)
+                return
+            # 单日：当日备注写入 detail，再打卡
+            _mode, text, ok = self._ask_complete_note(
+                title,
+                recurring=False,
+                parent=self.todo_list_win,
+                initial=str(plan.get("detail") or ""),
+            )
+            if not ok:
+                self._refresh_todolist_ui()
+                return
+            try:
+                if text != str(plan.get("detail") or "").strip():
+                    self.todos.update(
+                        item_id,
+                        title=str(plan.get("title") or ""),
+                        start=date.fromisoformat(str(plan["start"])),
+                        repeat=REPEAT_NONE,
+                        calendar_id=plan.get("calendar_id"),
+                        calendar_name=plan.get("calendar_name"),
+                        detail=text,
+                    )
+                self.todos.toggle(today, item_id)
+            except (KeyError, ValueError):
+                return
+            self.refresh_views()
+            self._icloud_push_plan(item_id)
+            return
+
+        # 取消完成：仅取消打卡（若是拆出的单日任务，系列仍跳过该日）
+        try:
+            self.todos.toggle(today, item_id)
+        except KeyError:
+            return
+        self.refresh_views()
+        self._icloud_push_plan(item_id)
+
     def startup_show(self) -> None:
         """Apply saved size/pos before first show; re-assert after layout/pin."""
         self._apply_saved_geometry()
@@ -181,6 +820,9 @@ class MainWindow(QMainWindow):
         self._pin_to_desktop()
         # Layout + Win32 z-order can disturb geometry — restore again from JSON.
         self._apply_saved_geometry()
+        self._place_todolist(force_dock=self._size_locked)
+        if bool(self.config.get("todolist_visible", True)):
+            self._set_todolist_visible(True, persist=False)
         self.show()
 
     def _build_chrome(self) -> None:
@@ -188,8 +830,10 @@ class MainWindow(QMainWindow):
         bar.setContentsMargins(0, 0, 0, 0)
         bar.setSpacing(4)
 
-        self.prev_btn = QPushButton(_ICON_PREV)
-        self.next_btn = QPushButton(_ICON_NEXT)
+        self.prev_btn = QPushButton()
+        self.next_btn = QPushButton()
+        self.prev_btn.setToolTip("上一周期")
+        self.next_btn.setToolTip("下一周期")
         self.title_label = QLabel("桌面日历")
         self.title_label.setObjectName("titleLabel")
         self.title_label.setMinimumWidth(140)
@@ -201,6 +845,8 @@ class MainWindow(QMainWindow):
         self.toggle_btn.setToolTip("展开本月")
         self.lock_btn = QPushButton(_ICON_LOCKED)
         self.lock_btn.setToolTip("锁定后不可移动/缩放/关闭；解锁后可调整，右键退出或最小化")
+        self.sync_btn = QPushButton(_ICON_SYNC)
+        self.sync_btn.setToolTip("立即同步 iCloud")
         self.settings_btn = QPushButton(_ICON_SETTINGS)
         self.settings_btn.setToolTip("设置")
         self.min_btn = QPushButton(_ICON_MIN)
@@ -213,6 +859,7 @@ class MainWindow(QMainWindow):
             self.next_btn,
             self.toggle_btn,
             self.lock_btn,
+            self.sync_btn,
             self.settings_btn,
             self.min_btn,
             self.close_btn,
@@ -222,12 +869,17 @@ class MainWindow(QMainWindow):
             btn.setFixedSize(32, 28)
             btn.setFlat(True)
 
+        self.prev_btn.setIconSize(QSize(16, 16))
+        self.next_btn.setIconSize(QSize(16, 16))
+        self._refresh_nav_icons()
+
         bar.addWidget(self.prev_btn)
         bar.addWidget(self.title_label, 1)
         bar.addWidget(self.next_btn)
         bar.addSpacing(6)
         bar.addWidget(self.toggle_btn)
         bar.addWidget(self.lock_btn)
+        bar.addWidget(self.sync_btn)
         bar.addWidget(self.settings_btn)
         bar.addWidget(self.min_btn)
         bar.addWidget(self.close_btn)
@@ -236,6 +888,7 @@ class MainWindow(QMainWindow):
         self.next_btn.clicked.connect(self._next)
         self.toggle_btn.clicked.connect(self._toggle_expand)
         self.lock_btn.clicked.connect(self._toggle_size_lock)
+        self.sync_btn.clicked.connect(self._on_chrome_sync)
         self.settings_btn.clicked.connect(self._open_settings)
         self.min_btn.clicked.connect(self._minimize_to_tray)
         self.close_btn.clicked.connect(self._minimize_to_tray)
@@ -249,6 +902,11 @@ class MainWindow(QMainWindow):
         self._ctx_menu.addAction(self._act_quit)
 
         self._layout.addLayout(bar)
+
+    def _refresh_nav_icons(self) -> None:
+        color = self._theme.get("text", "#EEF2F6")
+        self.prev_btn.setIcon(_browser_nav_icon(forward=False, color=color))
+        self.next_btn.setIcon(_browser_nav_icon(forward=True, color=color))
 
     def _apply_style(self) -> None:
         t = self._theme
@@ -283,6 +941,10 @@ class MainWindow(QMainWindow):
             }}
             """
         )
+        if hasattr(self, "prev_btn"):
+            self._refresh_nav_icons()
+        if hasattr(self, "todo_list_win"):
+            self.todo_list_win.apply_theme(self._theme)
 
     def _setup_tray(self) -> None:
         self.tray = QSystemTrayIcon(_tray_icon(), self)
@@ -307,6 +969,13 @@ class MainWindow(QMainWindow):
         if self._size_locked:
             return
         self._save_config()
+        # 隐藏待办但不改「显示今日待办」偏好
+        if hasattr(self, "todo_list_win"):
+            self._todolist_syncing_vis = True
+            try:
+                self.todo_list_win.force_hide()
+            finally:
+                self._todolist_syncing_vis = False
         self.hide()
 
     def _show_from_tray(self) -> None:
@@ -315,20 +984,29 @@ class MainWindow(QMainWindow):
         self._geometry_ready = True
         self._pin_to_desktop()
         self._apply_saved_geometry()
+        self._place_todolist(force_dock=self._size_locked)
+        if bool(self.config.get("todolist_visible", True)):
+            self._set_todolist_visible(True, persist=False)
 
     def _on_about_to_quit(self) -> None:
         self._save_config()
         self._bottom_timer.stop()
         self._clock.stop()
+        self._icloud_timer.stop()
         self.holidays.shutdown()
+        if hasattr(self, "todo_list_win"):
+            self.todo_list_win.force_hide()
 
     def _quit(self) -> None:
         """Tray/context quit — must fully leave the Qt event loop."""
         self._save_config()
         self._bottom_timer.stop()
         self._clock.stop()
+        self._icloud_timer.stop()
         self.holidays.shutdown()
         self.hide()
+        if hasattr(self, "todo_list_win"):
+            self.todo_list_win.force_hide()
         if hasattr(self, "tray") and self.tray is not None:
             self.tray.hide()
             self.tray.setContextMenu(None)
@@ -470,6 +1148,7 @@ class MainWindow(QMainWindow):
             self.setMinimumSize(self._min_size())
             self.setMaximumWidth(max_w)
         self._restore_geo = QRect(self.geometry())
+        self._dock_todolist()
 
 
     def _save_config(self) -> None:
@@ -501,6 +1180,21 @@ class MainWindow(QMainWindow):
         self.config.set("opacity", round(opacity, 4), persist=False)
         self.config.set("theme", dict(self._theme), persist=False)
         self.config.set("countries", list(self.holidays.countries()), persist=False)
+
+        visible = bool(self.config.get("todolist_visible", True))
+        self.config.set("todolist_visible", visible, persist=False)
+        if hasattr(self, "todo_list_win"):
+            if self._todo_docked or self._size_locked:
+                self._apply_todo_dock()
+            geo = self.todo_list_win.geometry()
+            if geo.width() >= 40 and geo.height() >= 40:
+                self.config.set("todolist_x", int(geo.x()), persist=False)
+                self.config.set("todolist_y", int(geo.y()), persist=False)
+                self.config.set("todolist_w", int(geo.width()), persist=False)
+                self.config.set("todolist_h", int(geo.height()), persist=False)
+            self.config.set("todolist_docked", bool(self._todo_docked), persist=False)
+            self.config.set("todolist_dock_side", self._todo_dock.side, persist=False)
+            self.config.set("todolist_dock_offset", int(self._todo_dock.offset), persist=False)
 
         self.config.save()
 
@@ -656,10 +1350,12 @@ class MainWindow(QMainWindow):
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         if self._resize_edges:
             self._perform_resize(event.globalPosition().toPoint())
+            self._dock_todolist()
             event.accept()
             return
         if self._drag_pos is not None and event.buttons() & Qt.MouseButton.LeftButton:
             self.move(event.globalPosition().toPoint() - self._drag_pos)
+            self._dock_todolist()
             event.accept()
             return
         edges = self._hit_edges(event.position().toPoint())
@@ -673,11 +1369,13 @@ class MainWindow(QMainWindow):
                 self._resize_origin = None
                 self._resize_mouse = None
                 self._save_config()
+                self._dock_todolist()
                 event.accept()
                 return
             if self._drag_pos is not None:
                 self._drag_pos = None
                 self._save_config()
+                self._dock_todolist()
                 event.accept()
                 return
         super().mouseReleaseEvent(event)
@@ -686,7 +1384,7 @@ class MainWindow(QMainWindow):
         self._size_locked = locked
         self.lock_btn.setText(_ICON_LOCKED if locked else _ICON_UNLOCKED)
         self.lock_btn.setToolTip(
-            "已锁定：不可移动、缩放、最小化或关闭。点击解锁。"
+            "已锁定：不可移动、缩放、最小化或关闭；今日待办不可关闭。点击解锁。"
             if locked
             else "已解锁：可拖动/缩放；右键可最小化或退出。点击锁定。"
         )
@@ -698,6 +1396,19 @@ class MainWindow(QMainWindow):
         if apply_size:
             # Keep current on-screen size; only toggle fixed/min constraints.
             self._set_window_size(QSize(self.width(), self.height()))
+        if hasattr(self, "todo_list_win"):
+            self.todo_list_win.set_interactive(not locked)
+            if locked:
+                geo = self.todo_list_win.geometry()
+                self.config.set("todolist_w", max(240, int(geo.width())), persist=False)
+                self.config.set("todolist_h", max(280, int(geo.height())), persist=False)
+                if not self._todo_docked:
+                    self._todo_dock = self._default_bottom_dock()
+                self._todo_docked = True
+                self._dock_todolist()
+                # 锁定时保持今日待办可见且不可关
+                self.config.set("todolist_visible", True, persist=False)
+                self._set_todolist_visible(True, persist=False)
         if persist:
             self.config.set("size_locked", locked)
             self._save_config()
@@ -710,6 +1421,7 @@ class MainWindow(QMainWindow):
         if persist and self.isVisible() and apply_size:
             self._save_config()
         cell_w, cell_h = self._cells_from_current()
+        was = self._expanded
         self._expanded = expanded
         self.week_view.setVisible(not expanded)
         self.month_view.setVisible(expanded)
@@ -725,6 +1437,11 @@ class MainWindow(QMainWindow):
         if persist:
             self.config.set("expanded", expanded)
             self._save_config()
+        if apply_size:
+            self._dock_todolist()
+        # 切到另一视图时补刷一次（平时只刷新可见视图）
+        if was != expanded:
+            self.refresh_views()
 
     def _update_title(self) -> None:
         if self._expanded:
@@ -746,19 +1463,49 @@ class MainWindow(QMainWindow):
 
     def refresh_views(self) -> None:
         self._update_title()
-        self.week_view.rebuild(
-            self._ref,
-            self.holidays.holidays_for,
-            self.todos.for_date,
-            theme=self._theme,
-        )
-        self.month_view.rebuild(
-            self._month.year,
-            self._month.month,
-            self.holidays.holidays_for,
-            self.todos.for_date,
-            theme=self._theme,
-        )
+        # 批量更新，减少勾选过滤时整窗闪烁
+        self.setUpdatesEnabled(False)
+        try:
+            if self._expanded:
+                self.month_view.refresh(
+                    self._month.year,
+                    self._month.month,
+                    self.holidays.holidays_for,
+                    self._todos_for_date,
+                    theme=self._theme,
+                )
+            else:
+                self.week_view.refresh(
+                    self._ref,
+                    self.holidays.holidays_for,
+                    self._todos_for_date,
+                    theme=self._theme,
+                )
+            self._refresh_todolist_ui()
+        finally:
+            self.setUpdatesEnabled(True)
+
+    def _todos_for_date(self, day: date):
+        items = self.todos.for_date(day)
+        if not self._icloud_enabled():
+            return items
+        enabled_ids = set(self._icloud_enabled_calendar_ids())
+        enabled_names = set(self._icloud_enabled_calendar_names())
+        # 用当前日历缓存把启用 id 映射成名称，避免 id 漂移后过滤失效
+        for info in self.icloud.list_calendars(use_cache=True):
+            if info.id in enabled_ids and info.name:
+                enabled_names.add(info.name)
+        out = []
+        for t in items:
+            cid = str(t.get("calendar_id") or "")
+            cname = str(t.get("calendar_name") or "").strip()
+            if not cid and not cname:
+                out.append(t)
+            elif cid and cid in enabled_ids:
+                out.append(t)
+            elif cname and cname in enabled_names:
+                out.append(t)
+        return out
 
     def _toggle_expand(self) -> None:
         self._apply_expanded(not self._expanded)
@@ -802,82 +1549,890 @@ class MainWindow(QMainWindow):
         except KeyError:
             return
         self.refresh_views()
+        self._icloud_push_plan(item_id)
 
     def _on_todo_edit(self, day: date, item_id: str) -> None:
-        item = next((t for t in self.todos.for_date(day) if t["id"] == item_id), None)
-        if not item:
+        plan = self.todos.get_plan(item_id)
+        if not plan:
             return
-        dlg = TodoEditDialog(day, item=item, parent=self)
+        item = dict(plan)
+        item["series_detail"] = str(plan.get("detail") or "")
+        item["day_detail"] = self.todos.day_detail(item_id, day)
+        for t in self.todos.for_date(day):
+            if t["id"] == item_id:
+                item["done"] = t.get("done")
+                break
+        dlg = TodoEditDialog(
+            day,
+            item=item,
+            calendars=self._enabled_calendars_for_ui(),
+            default_calendar_id=self._icloud_default_calendar_id(),
+            on_create_calendar=self._create_calendar_sync,
+            parent=self,
+        )
         if dlg.exec() != TodoEditDialog.DialogCode.Accepted:
             return
         try:
             if dlg.deleted:
-                self.todos.delete(day, item_id)
+                if dlg.delete_mode == DELETE_OCCURRENCE:
+                    self.todos.delete_occurrence(item_id, day)
+                    self._icloud_push_plan(item_id)
+                else:
+                    plan = self.todos.get_plan(item_id)
+                    uid = str((plan or {}).get("caldav_uid") or "")
+                    cal_id = str((plan or {}).get("calendar_id") or "") or None
+                    self.todos.delete(item_id)
+                    if uid:
+                        self._icloud_delete_uid(uid, calendar_id=cal_id)
             else:
-                self.todos.update(day, item_id, title=dlg.title_text)
+                # 先更新标题/日期/重复/日历
+                series_detail = None
+                if dlg.repeat_mode == REPEAT_NONE:
+                    # 单日：备注直接写入 detail
+                    series_detail = dlg.day_detail_text
+                elif dlg.note_mode == NOTE_MODE_SERIES:
+                    series_detail = dlg.detail_text
+
+                self.todos.update(
+                    item_id,
+                    title=dlg.title_text,
+                    start=dlg.plan_date,
+                    repeat=dlg.repeat_mode,
+                    calendar_id=dlg.calendar_id,
+                    calendar_name=dlg.calendar_name,
+                    detail=series_detail if series_detail is not None else None,
+                )
+
+                if (
+                    dlg.repeat_mode != REPEAT_NONE
+                    and dlg.note_mode == NOTE_MODE_DAY
+                ):
+                    # 周期 + 当日备注：拆出当日已完成单日任务，系列跳过该日
+                    series_id, new_id = self.todos.complete_recurring_day_as_standalone(
+                        item_id, day, detail=dlg.day_detail_text
+                    )
+                    self.refresh_views()
+                    self._icloud_push_plan(series_id)
+                    self._icloud_push_plan(new_id)
+                    return
+
+                self._icloud_push_plan(item_id)
         except ValueError as exc:
             QMessageBox.warning(self, "提示", str(exc))
+            return
+        except KeyError:
             return
         self.refresh_views()
 
     def _on_day_add(self, day: date) -> None:
-        dlg = TodoEditDialog(day, parent=self)
+        dlg = TodoEditDialog(
+            day,
+            calendars=self._enabled_calendars_for_ui(),
+            default_calendar_id=self._icloud_default_calendar_id(),
+            on_create_calendar=self._create_calendar_sync,
+            parent=self,
+        )
         if dlg.exec() != TodoEditDialog.DialogCode.Accepted:
             return
         try:
-            self.todos.add(day, dlg.title_text)
+            if dlg.repeat_mode == REPEAT_NONE:
+                detail = dlg.day_detail_text
+            else:
+                detail = dlg.detail_text
+            plan = self.todos.add(
+                dlg.plan_date,
+                dlg.title_text,
+                repeat=dlg.repeat_mode,
+                calendar_id=dlg.calendar_id,
+                calendar_name=dlg.calendar_name,
+                detail=detail,
+            )
+            if (
+                dlg.repeat_mode != REPEAT_NONE
+                and dlg.note_mode == NOTE_MODE_DAY
+            ):
+                # 新建周期却选当日备注：拆成已完成单日 + 系列从该日起出现但跳过当日
+                series_id, new_id = self.todos.complete_recurring_day_as_standalone(
+                    plan["id"], dlg.plan_date, detail=dlg.day_detail_text
+                )
+                self.refresh_views()
+                self._icloud_push_plan(series_id)
+                self._icloud_push_plan(new_id)
+                return
         except ValueError as exc:
             QMessageBox.warning(self, "提示", str(exc))
             return
         self.refresh_views()
+        self._icloud_push_plan(plan["id"])
+
+    def _on_chrome_sync(self) -> None:
+        if not self._icloud_enabled():
+            QMessageBox.information(
+                self,
+                "同步",
+                "请先在设置中启用 iCloud 同步，并填写 Apple ID 与应用专用密码。",
+            )
+            return
+        creds = self.icloud.load_credentials()
+        if not creds.get("apple_id") or not creds.get("app_password"):
+            QMessageBox.information(self, "同步", "未找到 iCloud 凭证，请先在设置中连接。")
+            return
+        self.sync_btn.setEnabled(False)
+        self.sync_btn.setToolTip("同步中…")
+
+        def done(ok: bool, msg: str) -> None:
+            self.sync_btn.setEnabled(True)
+            self.sync_btn.setToolTip("立即同步 iCloud")
+            if ok:
+                QMessageBox.information(self, "同步完成", msg)
+            else:
+                QMessageBox.warning(self, "同步失败", msg)
+
+        self._icloud_sync_now_from_dialog(
+            {
+                "enabled": True,
+                "apple_id": creds.get("apple_id", ""),
+                "app_password": creds.get("app_password", ""),
+                "calendar_name": self._icloud_calendar_name(),
+                "calendars_enabled": self._icloud_enabled_calendar_ids(),
+                "default_calendar_id": self._icloud_default_calendar_id(),
+                "poll_seconds": int(self.config.get("icloud_poll_seconds", 45) or 45),
+            },
+            done,
+        )
+
+    def _icloud_enabled(self) -> bool:
+        return bool(self.config.get("icloud_sync_enabled", False))
+
+    def _icloud_calendar_name(self) -> str:
+        name = str(self.config.get("icloud_calendar_name", DEFAULT_CALENDAR_NAME) or "")
+        return name.strip() or DEFAULT_CALENDAR_NAME
+
+    def _icloud_enabled_calendar_ids(self) -> list[str]:
+        raw = self.config.get("icloud_calendars_enabled", [])
+        if isinstance(raw, list):
+            return [str(x) for x in raw if x]
+        return []
+
+    def _icloud_enabled_calendar_names(self) -> list[str]:
+        raw = self.config.get("icloud_calendars_enabled_names", [])
+        if isinstance(raw, list):
+            return [str(x) for x in raw if x]
+        return []
+
+    def _icloud_set_enabled_calendars(
+        self,
+        enabled_ids: list[str],
+        *,
+        default_id: str = "",
+        enabled_names: list[str] | None = None,
+        refresh: bool = True,
+    ) -> None:
+        """写入启用日历（id+名称）并重映射本地计划，供勾选与主界面过滤共用。"""
+        cleaned = [str(x) for x in enabled_ids if x]
+        names = [str(n) for n in (enabled_names or []) if n]
+        if not names:
+            live = {c.id: c.name for c in self.icloud.list_calendars(use_cache=True)}
+            names = [live[cid] for cid in cleaned if cid in live and live[cid]]
+        self.config.set("icloud_calendars_enabled", cleaned, persist=False)
+        self.config.set("icloud_calendars_enabled_names", names, persist=False)
+        prefer = str(default_id or "")
+        if prefer and prefer not in cleaned:
+            prefer = cleaned[0] if cleaned else ""
+        elif not prefer and cleaned:
+            prefer = cleaned[0]
+        self.config.set("icloud_default_calendar_id", prefer, persist=False)
+        if prefer:
+            name = next(
+                (n for cid, n in zip(cleaned, names) if cid == prefer and n),
+                "",
+            )
+            if not name:
+                for info in self.icloud.list_calendars(use_cache=True):
+                    if info.id == prefer:
+                        name = info.name
+                        break
+            if name:
+                self.config.set("icloud_calendar_name", name, persist=False)
+        self.config.save()
+        self._remap_plans_calendar_ids_by_name()
+        if refresh:
+            self.refresh_views()
+
+    def _remap_plans_calendar_ids_by_name(self) -> None:
+        """按日历显示名把本地计划的 calendar_id 对齐到当前 live id。"""
+        live_by_name = {
+            c.name: c for c in self.icloud.list_calendars(use_cache=True) if c.name
+        }
+        if not live_by_name:
+            return
+        for plan in self.todos.all_plans():
+            cname = str(plan.get("calendar_name") or "").strip()
+            if not cname or cname not in live_by_name:
+                continue
+            info = live_by_name[cname]
+            if str(plan.get("calendar_id") or "") == info.id:
+                continue
+            try:
+                self.todos.set_calendar(
+                    str(plan["id"]),
+                    calendar_id=info.id,
+                    calendar_name=info.name,
+                    touch=False,
+                )
+            except KeyError:
+                continue
+
+    def _realign_enabled_ids_to_live(
+        self,
+        live_ids: set[str],
+        *,
+        names_hint: set[str] | None = None,
+    ) -> list[str]:
+        """刷新后把启用列表对齐到 live id（保留名称勾选语义）。"""
+        by_id = {
+            c.id: c
+            for c in self.icloud.list_calendars(use_cache=True)
+            if not live_ids or c.id in live_ids
+        }
+        by_name = {c.name: c for c in by_id.values() if c.name}
+        enabled = self._icloud_enabled_calendar_ids()
+        names = set(self._icloud_enabled_calendar_names())
+        if names_hint:
+            names |= {str(n) for n in names_hint if n}
+        out: list[str] = []
+        seen: set[str] = set()
+        for cid in enabled:
+            if cid in by_id and cid not in seen:
+                out.append(cid)
+                seen.add(cid)
+                if by_id[cid].name:
+                    names.add(by_id[cid].name)
+        for n in list(names):
+            info = by_name.get(n)
+            if info and info.id not in seen:
+                out.append(info.id)
+                seen.add(info.id)
+        # 对不上任何 live 时绝不能写成空（否则视图会像「全没勾选」）
+        if enabled and not out:
+            return enabled
+        name_list = [
+            by_id[cid].name for cid in out if cid in by_id and by_id[cid].name
+        ] or sorted(names)
+        if out != enabled or name_list != self._icloud_enabled_calendar_names():
+            self._icloud_set_enabled_calendars(
+                out,
+                default_id=self._icloud_default_calendar_id(),
+                enabled_names=name_list,
+                refresh=False,
+            )
+        return out
+
+    def _icloud_default_calendar_id(self) -> str:
+        return str(self.config.get("icloud_default_calendar_id", "") or "")
+
+    def _enabled_calendars_for_ui(self) -> list[dict[str, str]]:
+        enabled = set(self._icloud_enabled_calendar_ids())
+        cached = self.icloud.list_calendars(use_cache=True)
+        out: list[dict[str, str]] = []
+        for info in cached:
+            if info.id in enabled:
+                out.append({"id": info.id, "name": info.name})
+        if not out and self._icloud_calendar_name():
+            out.append({"id": "", "name": self._icloud_calendar_name()})
+        return out
+
+    def _create_calendar_sync(self, name: str) -> dict[str, str]:
+        """在计划对话框中同步创建日历（短阻塞；失败抛异常）。"""
+        self.icloud.ensure_connected()
+        info = self.icloud.ensure_calendar(name)
+        enabled = self._icloud_enabled_calendar_ids()
+        if info.id not in enabled:
+            enabled.append(info.id)
+            self.config.set("icloud_calendars_enabled", enabled, persist=False)
+            if not self._icloud_default_calendar_id():
+                self.config.set("icloud_default_calendar_id", info.id, persist=False)
+            self.config.save()
+        return {"id": info.id, "name": info.name}
+
+    def _reload_icloud_timer(self) -> None:
+        self._icloud_timer.stop()
+        if not self._icloud_enabled():
+            return
+        seconds = int(self.config.get("icloud_poll_seconds", 45) or 45)
+        seconds = max(15, min(600, seconds))
+        self._icloud_timer.setInterval(seconds * 1000)
+        self._icloud_timer.start()
+        QTimer.singleShot(2500, self._icloud_poll)
+
+    def _run_icloud_job(self, fn, on_ok=None, on_err=None) -> None:  # noqa: ANN001
+        job = _ICloudJob(fn, self)
+
+        def _ok(result: object) -> None:
+            if job in self._icloud_jobs:
+                self._icloud_jobs.remove(job)
+            if on_ok:
+                on_ok(result)
+
+        def _err(msg: str) -> None:
+            if job in self._icloud_jobs:
+                self._icloud_jobs.remove(job)
+            if on_err:
+                on_err(msg)
+
+        job.finished_ok.connect(_ok)
+        job.finished_err.connect(_err)
+        self._icloud_jobs.append(job)
+        job.start()
+
+    def _prepare_plan_for_push(self, plan: dict) -> dict:
+        """补全默认日历字段后返回副本。"""
+        p = dict(plan)
+        if not p.get("calendar_id") and not p.get("calendar_name"):
+            default_id = self._icloud_default_calendar_id()
+            if default_id:
+                p["calendar_id"] = default_id
+            p["calendar_name"] = self._icloud_calendar_name()
+        return p
+
+    def _icloud_push_plan(self, item_id: str) -> None:
+        if not self._icloud_enabled():
+            return
+        plan = self.todos.get_plan(item_id)
+        if not plan:
+            return
+        plan = self._prepare_plan_for_push(plan)
+
+        def work():
+            self.icloud.ensure_connected()
+            try:
+                uid, etag = self.icloud.upsert_plan(plan)
+            except RuntimeError:
+                # 目标日历已在 iCloud 删除：不自动新建
+                return None
+            return item_id, uid, etag, plan.get("calendar_id"), plan.get("calendar_name")
+
+        def ok(result: object) -> None:
+            if not isinstance(result, tuple) or len(result) != 5:
+                return
+            pid, uid, etag, cid, cname = result
+            try:
+                self.todos.set_caldav_meta(str(pid), caldav_uid=str(uid), caldav_etag=etag)
+                if cid:
+                    self.todos.set_calendar(
+                        str(pid),
+                        calendar_id=str(cid),
+                        calendar_name=str(cname) if cname else None,
+                        touch=False,
+                    )
+            except KeyError:
+                return
+
+        self._run_icloud_job(work, on_ok=ok)
+
+    def _icloud_delete_uid(self, uid: str, *, calendar_id: str | None = None) -> None:
+        if not self._icloud_enabled() or not uid:
+            return
+
+        def work():
+            self.icloud.ensure_connected()
+            self.icloud.delete_event(uid, calendar_id=calendar_id)
+            return True
+
+        self._run_icloud_job(work)
+
+    def _prune_enabled_calendars(self, live_ids: set[str]) -> list[str]:
+        """去掉 iCloud 上已不存在的启用日历，避免反复按名重建。"""
+        enabled = self._icloud_enabled_calendar_ids()
+        # 刷新失败得到空集合时绝不清空本地勾选
+        if not live_ids:
+            return enabled
+        pruned = [cid for cid in enabled if cid in live_ids]
+        # 若一个都匹配不上，更可能是临时异常，保留原勾选
+        if enabled and not pruned:
+            return enabled
+        changed = pruned != enabled
+        if changed:
+            self.config.set("icloud_calendars_enabled", pruned, persist=False)
+        default_id = str(self.config.get("icloud_default_calendar_id") or "")
+        if default_id and default_id not in live_ids:
+            self.config.set(
+                "icloud_default_calendar_id",
+                pruned[0] if pruned else "",
+                persist=False,
+            )
+            changed = True
+        if changed:
+            self.config.save()
+        return pruned
+
+    def _icloud_poll(self) -> None:
+        if not self._icloud_enabled():
+            return
+        enabled_ids = self._icloud_enabled_calendar_ids()
+        enabled_names = self._icloud_enabled_calendar_names()
+        plans_to_push = [
+            self._prepare_plan_for_push(p)
+            for p in self.todos.all_plans()
+            if plan_needs_push(p)
+        ]
+
+        def work():
+            self.icloud.ensure_connected()
+            cals = self.icloud.refresh_calendars()
+            live_ids = {c.id for c in cals}
+            by_name = {c.name: c.id for c in cals if c.name}
+            # 按 id，再按名称补齐（防止 id 漂移后 active 变空触发误删）
+            active: list[str] = []
+            seen: set[str] = set()
+            for cid in enabled_ids:
+                if cid in live_ids and cid not in seen:
+                    active.append(cid)
+                    seen.add(cid)
+            for n in enabled_names:
+                cid = by_name.get(str(n))
+                if cid and cid not in seen:
+                    active.append(cid)
+                    seen.add(cid)
+            meta: list[tuple[str, str, str | None, str | None, str | None]] = []
+            for plan in plans_to_push:
+                cid = str(plan.get("calendar_id") or "")
+                if active and cid and cid not in active:
+                    continue
+                if active and cid and cid not in live_ids:
+                    continue
+                try:
+                    uid, etag = self.icloud.upsert_plan(plan)
+                except RuntimeError:
+                    # 所属日历已删：跳过，不自动新建
+                    continue
+                meta.append(
+                    (
+                        str(plan["id"]),
+                        str(uid),
+                        etag,
+                        plan.get("calendar_id"),
+                        plan.get("calendar_name"),
+                    )
+                )
+            remotes = []
+            scope: set[str] = set()
+            for cid in active:
+                try:
+                    remotes.extend(self.icloud.list_events(cid))
+                    scope.add(cid)
+                except Exception:  # noqa: BLE001
+                    continue
+            return meta, remotes, scope, live_ids
+
+        def ok(result: object) -> None:
+            if not isinstance(result, tuple) or len(result) != 4:
+                return
+            meta, remotes, scope, live_ids = result
+            live_set = set(live_ids) if isinstance(live_ids, set) else set(live_ids or [])
+            self._prune_enabled_calendars(live_set)
+            self._realign_enabled_ids_to_live(live_set)
+            for row in meta:
+                pid, uid, etag, cid, cname = row
+                try:
+                    self.todos.set_caldav_meta(pid, caldav_uid=uid, caldav_etag=etag)
+                    if cid:
+                        self.todos.set_calendar(
+                            pid,
+                            calendar_id=str(cid),
+                            calendar_name=str(cname) if cname else None,
+                            touch=False,
+                        )
+                except KeyError:
+                    continue
+            scope_ids = scope if isinstance(scope, set) else set(scope or [])
+            self.icloud.reconcile_with_remotes(
+                self.todos, remotes, scope_calendar_ids=scope_ids
+            )
+            # prune/realign 也可能改了启用列表，统一刷新显示
+            self.refresh_views()
+
+        self._run_icloud_job(work, on_ok=ok)
+
+    def _icloud_apply_settings_dict(self, data: dict) -> None:
+        apple_id = str(data.get("apple_id", "")).strip()
+        password = str(data.get("app_password", "")).strip()
+        old = self.icloud.load_credentials()
+        creds_changed = (
+            str(old.get("apple_id", "")).strip() != apple_id
+            or str(old.get("app_password", "")).strip() != password
+        )
+        if apple_id and password:
+            self.icloud.save_credentials(apple_id=apple_id, app_password=password)
+        else:
+            self.icloud.clear_credentials()
+            creds_changed = True
+        # 仅账号变更时断开；勾选日历变化不断开，避免刷新后 id 漂移把启用列表写空
+        if creds_changed:
+            self.icloud.disconnect()
+        self.config.set("icloud_sync_enabled", bool(data.get("enabled", False)), persist=False)
+        self.config.set(
+            "icloud_calendar_name",
+            str(data.get("calendar_name", DEFAULT_CALENDAR_NAME) or DEFAULT_CALENDAR_NAME),
+            persist=False,
+        )
+        enabled = data.get("calendars_enabled")
+        if isinstance(enabled, list):
+            cleaned = [str(x) for x in enabled if x]
+            # 避免异步回调里读到空勾选把已有配置误清空
+            if cleaned or not self._icloud_enabled_calendar_ids():
+                names_from_ui = [
+                    str(n)
+                    for n in (data.get("calendars_enabled_names") or [])
+                    if n
+                ]
+                live = {c.id: c.name for c in self.icloud.list_calendars(use_cache=True)}
+                names = names_from_ui or [
+                    live[cid] for cid in cleaned if cid in live and live[cid]
+                ]
+                # 名称仍空时保留旧名称，供后续按名 realign
+                if not names and cleaned:
+                    names = list(self._icloud_enabled_calendar_names())
+                self.config.set("icloud_calendars_enabled", cleaned, persist=False)
+                self.config.set("icloud_calendars_enabled_names", names, persist=False)
+                self._remap_plans_calendar_ids_by_name()
+        default_id = str(data.get("default_calendar_id") or "")
+        if default_id or not self._icloud_default_calendar_id():
+            self.config.set("icloud_default_calendar_id", default_id, persist=False)
+        self.config.set(
+            "icloud_poll_seconds",
+            int(data.get("poll_seconds", 45) or 45),
+            persist=False,
+        )
+        self.config.save()
+        self._reload_icloud_timer()
+
+    def _icloud_test_from_dialog(self, data: dict, done) -> None:  # noqa: ANN001
+        self._icloud_apply_settings_dict({**data, "enabled": True})
+
+        def work():
+            return self.icloud.test_connection()
+
+        def ok(result: object) -> None:
+            done(True, str(result))
+
+        def err(msg: str) -> None:
+            done(False, msg)
+
+        self._run_icloud_job(work, on_ok=ok, on_err=err)
+
+    def _icloud_refresh_calendars_from_dialog(self, data: dict, done) -> None:  # noqa: ANN001
+        self._icloud_apply_settings_dict({**data, "enabled": data.get("enabled", True)})
+
+        def work():
+            cals = self.icloud.refresh_calendars()
+            live_ids = {c.id for c in cals}
+            # 迁移：旧「桌面计划」名匹配启用
+            legacy = str(data.get("calendar_name") or DEFAULT_CALENDAR_NAME)
+            enabled = [str(x) for x in (data.get("calendars_enabled") or []) if x]
+            # 去掉已在 iCloud 删除的
+            enabled = [cid for cid in enabled if cid in live_ids]
+            if not enabled:
+                for c in cals:
+                    if c.name == legacy:
+                        enabled = [c.id]
+                        break
+            return [
+                {"id": c.id, "name": c.name, "writable": c.writable} for c in cals
+            ], enabled, live_ids
+
+        def ok(result: object) -> None:
+            if not isinstance(result, tuple) or len(result) < 2:
+                done(False, "刷新返回异常")
+                return
+            cals, enabled = result[0], result[1]
+            live_ids = result[2] if len(result) > 2 else {
+                str(x.get("id")) for x in cals if isinstance(x, dict) and x.get("id")
+            }
+            self._prune_enabled_calendars(set(live_ids))
+            self._realign_enabled_ids_to_live(set(live_ids) if isinstance(live_ids, set) else set(live_ids or []))
+            # 若配置为空但刷新算出了迁移启用，写入
+            if enabled and not self._icloud_enabled_calendar_ids():
+                self._icloud_set_enabled_calendars(
+                    [str(x) for x in enabled if x],
+                    default_id=str(enabled[0]) if enabled else "",
+                    refresh=False,
+                )
+            done(True, cals)
+
+        def err(msg: str) -> None:
+            done(False, msg)
+
+        self._run_icloud_job(work, on_ok=ok, on_err=err)
+
+    def _icloud_create_calendar_from_dialog(self, data: dict, name: str, done) -> None:  # noqa: ANN001
+        """新建日历：保留原勾选 + 勾上新建项，并以此过滤主界面显示。"""
+        preserved = [str(x) for x in (data.get("calendars_enabled") or []) if x]
+        preserved_names = {
+            str(n).strip()
+            for n in (data.get("calendars_enabled_names") or [])
+            if str(n).strip()
+        }
+        if not preserved:
+            preserved = self._icloud_enabled_calendar_ids()
+        # 配置里若只有 id，用缓存日历名补全，便于刷新后按名回填
+        if preserved and not preserved_names:
+            for info in self.icloud.list_calendars(use_cache=True):
+                if info.id in preserved and info.name:
+                    preserved_names.add(info.name)
+        default_id = str(data.get("default_calendar_id") or "") or self._icloud_default_calendar_id()
+        default_name = str(data.get("calendar_name") or "").strip()
+        # 只更新凭证，不做完整 apply（避免 disconnect + 轮询与创建抢跑）
+        apple_id = str(data.get("apple_id", "")).strip()
+        password = str(data.get("app_password", "")).strip()
+        if apple_id and password:
+            self.icloud.save_credentials(apple_id=apple_id, app_password=password)
+
+        def work():
+            self.icloud.ensure_connected()
+            self.icloud.ensure_calendar(name)
+            # 必须以刷新后的列表为准，ensure 返回的 id 可能与列表不一致
+            cals = self.icloud.refresh_calendars()
+            live = {c.id: c for c in cals}
+            by_name = {c.name: c for c in cals}
+            new_info = by_name.get(name.strip())
+            new_id = new_info.id if new_info else ""
+            new_name = new_info.name if new_info else name.strip()
+
+            enabled: list[str] = []
+            seen: set[str] = set()
+            names_out = set(preserved_names)
+            # 1) 原 id 仍在
+            for cid in preserved:
+                if cid in live and cid not in seen:
+                    enabled.append(cid)
+                    seen.add(cid)
+                    names_out.add(live[cid].name)
+            # 2) id 变了：按原勾选名称找回
+            for cname in list(preserved_names):
+                info = by_name.get(cname)
+                if info and info.id not in seen:
+                    enabled.append(info.id)
+                    seen.add(info.id)
+                    names_out.add(info.name)
+            # 3) 新建项
+            if new_id and new_id not in seen:
+                enabled.append(new_id)
+                seen.add(new_id)
+            if new_name:
+                names_out.add(new_name)
+
+            prefer = default_id if default_id in seen else ""
+            if not prefer and default_name:
+                info = by_name.get(default_name)
+                if info and info.id in seen:
+                    prefer = info.id
+            if not prefer and enabled:
+                prefer = enabled[0]
+
+            return {
+                "calendars": [
+                    {"id": c.id, "name": c.name, "writable": c.writable} for c in cals
+                ],
+                "enabled": enabled,
+                "enabled_names": sorted(names_out),
+                "new_id": new_id,
+                "new_name": new_name,
+                "default_id": prefer,
+            }
+
+        def ok(result: object) -> None:
+            if not isinstance(result, dict):
+                done(False, "创建返回异常")
+                return
+            enabled = [str(x) for x in (result.get("enabled") or []) if x]
+            prefer = str(result.get("default_id") or "")
+            names = [str(n) for n in (result.get("enabled_names") or []) if n]
+            self._icloud_set_enabled_calendars(
+                enabled,
+                default_id=prefer,
+                enabled_names=names,
+                refresh=True,
+            )
+            self.config.set("icloud_sync_enabled", True, persist=False)
+            self.config.save()
+            done(True, result)
+
+        def err(msg: str) -> None:
+            done(False, msg)
+
+        self._run_icloud_job(work, on_ok=ok, on_err=err)
+
+    def _icloud_sync_now_from_dialog(self, data: dict, done) -> None:  # noqa: ANN001
+        self._icloud_apply_settings_dict({**data, "enabled": True})
+        enabled_ids = [str(x) for x in (data.get("calendars_enabled") or []) if x]
+        if not enabled_ids:
+            enabled_ids = self._icloud_enabled_calendar_ids()
+        enabled_names = [str(x) for x in (data.get("calendars_enabled_names") or []) if x]
+        if not enabled_names:
+            enabled_names = self._icloud_enabled_calendar_names()
+        plans = [
+            self._prepare_plan_for_push(p)
+            for p in self.todos.all_plans()
+            if plan_needs_push(p)
+        ]
+
+        def work():
+            self.icloud.ensure_connected()
+            cals = self.icloud.refresh_calendars()
+            live_ids = {c.id for c in cals}
+            by_name = {c.name: c.id for c in cals if c.name}
+            active: list[str] = []
+            seen: set[str] = set()
+            for cid in enabled_ids:
+                if cid in live_ids and cid not in seen:
+                    active.append(cid)
+                    seen.add(cid)
+            for n in enabled_names:
+                cid = by_name.get(str(n))
+                if cid and cid not in seen:
+                    active.append(cid)
+                    seen.add(cid)
+            meta: list[tuple[str, str, str | None, str | None, str | None]] = []
+            for plan in plans:
+                cid = str(plan.get("calendar_id") or "")
+                if active and cid and cid not in active:
+                    continue
+                try:
+                    uid, etag = self.icloud.upsert_plan(plan)
+                except RuntimeError:
+                    continue
+                meta.append(
+                    (
+                        str(plan["id"]),
+                        str(uid),
+                        etag,
+                        plan.get("calendar_id"),
+                        plan.get("calendar_name"),
+                    )
+                )
+            remotes = []
+            scope: set[str] = set()
+            for cid in active:
+                try:
+                    remotes.extend(self.icloud.list_events(cid))
+                    scope.add(cid)
+                except Exception:  # noqa: BLE001
+                    continue
+            return meta, remotes, scope, live_ids
+
+        def ok(result: object) -> None:
+            if not isinstance(result, tuple) or len(result) != 4:
+                done(False, "同步返回异常")
+                return
+            meta, remotes, scope, live_ids = result
+            live_set = set(live_ids) if isinstance(live_ids, set) else set(live_ids or [])
+            pruned = self._prune_enabled_calendars(live_set)
+            self._realign_enabled_ids_to_live(live_set)
+            for row in meta:
+                pid, uid, etag, cid, cname = row
+                try:
+                    self.todos.set_caldav_meta(pid, caldav_uid=uid, caldav_etag=etag)
+                    if cid:
+                        self.todos.set_calendar(
+                            pid,
+                            calendar_id=str(cid),
+                            calendar_name=str(cname) if cname else None,
+                            touch=False,
+                        )
+                except KeyError:
+                    continue
+            scope_ids = scope if isinstance(scope, set) else set(scope or [])
+            changed = self.icloud.reconcile_with_remotes(
+                self.todos, remotes, scope_calendar_ids=scope_ids
+            )
+            self.refresh_views()
+            parts = ["已与 iCloud 对账完成"]
+            parts.append("（有计划更新）" if changed else "（计划无变更）")
+            if enabled_ids and len(pruned) < len(enabled_ids):
+                parts.append(
+                    f"；已移除 {len(enabled_ids) - len(pruned)} 个在 iCloud 上已删除的日历"
+                )
+            done(True, "".join(parts))
+
+        def err(msg: str) -> None:
+            done(False, msg)
+
+        self._run_icloud_job(work, on_ok=ok, on_err=err)
+
+    def _clear_local_plans_from_dialog(self) -> None:
+        n = self.todos.clear_all()
+        self.refresh_views()
+        self._refresh_todolist_ui()
+        QMessageBox.information(
+            self,
+            "已清除计划",
+            f"已删除本地计划 {n} 条。" if n else "本地没有可清除的计划。",
+        )
 
     def _open_settings(self) -> None:
-        prev_opacity = float(self.config.get("opacity", 0.92))
-        prev_theme = dict(self._theme)
-
-        def preview_opacity(op: float) -> None:
-            self.setWindowOpacity(op)
-
-        def preview_theme(theme: dict) -> None:
-            self._theme = merge_theme(theme)
-            self._apply_style()
-            self.refresh_views()
+        creds = self.icloud.load_credentials()
+        cached = [
+            {"id": c.id, "name": c.name, "writable": c.writable}
+            for c in self.icloud.list_calendars(use_cache=True)
+        ]
 
         dlg = SettingsDialog(
             countries=self.holidays.countries(),
             available=self.holidays.available_countries(),
-            opacity=prev_opacity,
-            theme=prev_theme,
-            on_opacity_preview=preview_opacity,
-            on_theme_preview=preview_theme,
+            opacity=float(self.config.get("opacity", 0.92)),
+            theme=dict(self._theme),
+            icloud={
+                "enabled": self._icloud_enabled(),
+                "apple_id": creds.get("apple_id", ""),
+                "app_password": creds.get("app_password", ""),
+                "calendar_name": self._icloud_calendar_name(),
+                "calendars_enabled": self._icloud_enabled_calendar_ids(),
+                "default_calendar_id": self._icloud_default_calendar_id(),
+                "calendars": cached,
+                "poll_seconds": int(self.config.get("icloud_poll_seconds", 45) or 45),
+                "todolist_visible": bool(self.config.get("todolist_visible", True)),
+            },
+            on_icloud_test=self._icloud_test_from_dialog,
+            on_icloud_sync_now=self._icloud_sync_now_from_dialog,
+            on_icloud_refresh_calendars=self._icloud_refresh_calendars_from_dialog,
+            on_icloud_create_calendar=self._icloud_create_calendar_from_dialog,
+            on_icloud_set_enabled_calendars=lambda ids, default_id, names: self._icloud_set_enabled_calendars(
+                list(ids),
+                default_id=str(default_id or ""),
+                enabled_names=list(names or []),
+                refresh=True,
+            ),
+            on_clear_plans=self._clear_local_plans_from_dialog,
             parent=None,
         )
-        # Refresh country list in background; dialog already has curated list.
+
+        def apply_now() -> None:
+            countries = dlg.selected_countries() or ["CN"]
+            self._theme = merge_theme(dlg.theme())
+            op = dlg.opacity()
+            self.setWindowOpacity(op)
+            if hasattr(self, "todo_list_win"):
+                self.todo_list_win.setWindowOpacity(op)
+            self._apply_style()
+            self.holidays.set_countries(countries)
+            self._ensure_holiday_years()
+            self._icloud_apply_settings_dict(dlg.icloud_settings())
+            self._set_todolist_visible(dlg.show_todolist(), persist=True)
+            self.refresh_views()
+            self._save_config()
+            self._pin_to_desktop()
+            self._dock_todolist()
+
+        dlg.set_on_changed(apply_now)
         self.holidays.countries_refreshed.connect(dlg.replace_countries)
         self.holidays.refresh_available_from_api_async()
 
-        if dlg.exec() != SettingsDialog.DialogCode.Accepted:
-            self.setWindowOpacity(prev_opacity)
-            self._theme = merge_theme(prev_theme)
-            self._apply_style()
-            self.refresh_views()
+        def on_finished(_code: int = 0) -> None:
             try:
                 self.holidays.countries_refreshed.disconnect(dlg.replace_countries)
             except (TypeError, RuntimeError):
                 pass
-            return
-        try:
-            self.holidays.countries_refreshed.disconnect(dlg.replace_countries)
-        except (TypeError, RuntimeError):
-            pass
 
-        countries = dlg.selected_countries() or ["CN"]
-        self._theme = merge_theme(dlg.theme())
-        self.setWindowOpacity(dlg.opacity())
-        self._apply_style()
-        self.holidays.set_countries(countries)
-        self._ensure_holiday_years()
-        self.refresh_views()
-        self._save_config()
-        self._pin_to_desktop()
-        self._apply_saved_geometry()
+        dlg.finished.connect(on_finished)
+        dlg.exec()

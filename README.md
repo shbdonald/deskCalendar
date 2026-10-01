@@ -1,12 +1,18 @@
 # 桌面日历（Desktop Calendar）
 
 Windows 桌面日历小组件，基于 **Python + PySide6**。  
-默认显示本周（周日→周六），可展开为本月；格内显示待办与多国节假日。窗口置底、可锁定，配置保存在项目 `data/` 目录。
+默认显示本周（周日→周六），可展开为本月；格内显示计划与多国节假日。窗口置底、可锁定，配置保存在项目 `data/` 目录。
+
+回滚到加「重复计划」之前的版本：
+
+```bash
+git checkout baseline-pre-plans
+```
 
 ## 环境与运行
 
 - Windows 10 / 11 · Python 3.10+（推荐 3.11+）
-- 依赖：`PySide6`、`httpx`
+- 依赖：`PySide6`、`httpx`、`caldav`、`icalendar`
 
 ```bash
 cd desktopcalendar
@@ -52,15 +58,54 @@ pyinstaller -F -w -n DesktopCalendar main.py
 
 入口：`MainWindow._apply_expanded` / `_prev` / `_next`。
 
-### 2. 待办
+### 2. 计划（可重复）
 
 | 逻辑 | 说明 | 关键名 |
 |------|------|--------|
-| 存储 | 按日期 ISO 键写入 JSON | `todos.json`；`TodoStore`；键：`date_key` → `YYYY-MM-DD` |
-| 项结构 | `id` / `title` / `done` | `TodoStore.add` / `update` / `toggle` / `delete` |
-| 单击 | 220ms 防抖后切换完成 | `TodoLine` 定时器间隔 `220`；信号 `clicked` |
-| 双击待办 | 编辑或删除 | 信号 `double_clicked` → `TodoEditDialog` |
-| 双击空白格 | 新建 | `DayCell.day_add` |
+| 存储 | 扁平 `plans` 列表（启动时自动迁移旧按日键格式） | `todos.json`；`TodoStore` |
+| 项结构 | `title` / `detail`（系列）/ `occurrence_details`（按日备注）/ … | 完成时可写当日情况；同步进日历 DESCRIPTION |
+| 展开 | `for_date(d)` 按重复规则投影到日历格 | `occurs_on` |
+| 同步方向 | 比较 `updated_at` 与远端 `LAST-MODIFIED` / `X-DESKTOPCAL-UPDATED`；手机删除且本地未再改 → 跟删；本地更新过 → 再推 | `plan_needs_push`、`reconcile_with_remotes` |
+| 单击 | （格子内计划不可单击打卡；请在「今日待办」窗口勾选） | — |
+| 双击计划 | 改标题/日期/重复/日历，或删除整条/当日 | `TodoEditDialog` |
+| 双击空白格 | 新建计划（可选日历标签） | `DayCell.day_add` |
+
+### 2.1 iCloud 日历（标签）双向同步
+
+iCloud 里的「个人 / 工作 / 租房」等就是**日历**；本应用把它们当作可选标签：设置里勾选同步哪些，建计划时选择或新建，并与 iPhone 对应日历双向同步。
+
+| 逻辑 | 说明 |
+|------|------|
+| 协议 | CalDAV，事件为全天 VEVENT（可含 RRULE） |
+| 多日历 | 设置中「刷新列表」后多选要同步的日历；可「新建日历」 |
+| 默认日历 | 「新建计划默认」下拉；计划也可单独选日历 |
+| 凭证 | Apple ID + [应用专用密码](https://appleid.apple.com)，保存在 `data/icloud_caldav.json`（不入库） |
+| 推送 | 本地新增/编辑/删除/打卡后异步写入所属日历 |
+| 拉取 | 对每个已启用日历轮询对账（默认 45 秒） |
+| 生日等 | 通讯录系统「生日」日历（URL 含 birthday）不列出；**你自建的同名日历会列出并同步** |
+| 节日 | **不同步**到 iCloud；桌面端仍用 Nager 显示公共假日 |
+| 格子显示 | 多日历时行内前缀短名，如 `[工作] 开会` |
+| 关联字段 | `caldav_uid`、`calendar_id` / `calendar_name`；打卡为 `X-DESKTOPCAL-COMPLETIONS` |
+
+设置路径：齿轮 → 「iCloud 日历（标签）双向同步」→ 填写账号 → **刷新列表并勾选** → 测试连接 / 立即同步 → 勾选启用。
+
+旧配置若只有单一日历名（如「桌面计划」），刷新后会按名称匹配并自动勾选。
+
+iPhone：系统设置 → 日历 → 账户 → iCloud，确保日历开关打开，即可在「日历」App 中看到对应日历。
+
+冲突策略：后写入为准；刚推送后短时间内轮询不会用旧副本覆盖。
+
+### 2.2 今日待办窗口
+
+独立小窗，投影**当天**日历计划；设置中可开关「显示今日待办窗口」（默认关）。关闭小窗仅隐藏。
+
+| 逻辑 | 说明 |
+|------|------|
+| 数据 | 与日历格子同源（`TodoStore` 当日投影），非独立清单文件 |
+| 勾选完成 | 在窗口内打卡；**周期计划会拆成「今日单日任务」**并写入备注，系列跳过当天（互不影响，手机上也是独立事件） |
+| 删除 | **仅删除今日**（重复计划写入 exceptions；单次计划整条删除） |
+| 添加 | 创建今天的不重复计划（默认日历） |
+| 格子 | 仍显示计划；**不能单击打卡**；双击仍可编辑（对话框可删全部周期） |
 
 ### 3. 节假日
 
@@ -154,7 +199,8 @@ pyinstaller -F -w -n DesktopCalendar main.py
 | `‹` / `›` | 上周/下周 或 上月/下月 |
 | `▼` / `▲` | 展开本月 / 收起本周 |
 | `🔒` / `🔓` | 锁定 / 解锁 |
-| `⚙` | 设置（国家、配色方案、不透明度） |
+| `🔄` | 立即同步 iCloud（须先在设置中启用） |
+| `⚙` | 设置（国家、配色方案、不透明度、iCloud） |
 | `–` `✕` | 最小化到托盘（仅解锁时显示） |
 | 托盘 | 显示 / 退出（锁定也可退出） |
 
@@ -165,7 +211,9 @@ pyinstaller -F -w -n DesktopCalendar main.py
 ```
 desktopcalendar/data/
   config.json      # defaults + session
-  todos.json       # 待办
+  todos.json       # 计划（含重复与 caldav_uid）
+  icloud_caldav.json  # iCloud 凭证（本地，勿分享）
+  icloud_calendars.json  # 日历列表缓存（本地）
   holidays/        # 各国节假日缓存 CC_YEAR.json
 ```
 
@@ -187,12 +235,14 @@ desktopcalendar/
       layout_metrics.py        # 格↔窗尺寸公式与 MIN_*
       config_store.py          # defaults/session 读写
       theme.py                 # 默认色 + 配色方案
-      todo_store.py            # 待办持久化
+      todo_store.py            # 计划持久化与重复展开
+      todo_list_store.py       # 独立待办清单
+      icloud_calendar_sync.py  # iCloud CalDAV 双向同步
       holiday_service.py       # Nager 拉取与缓存
       desktop_embed.py         # send_to_bottom（仅 Z 序）
     widgets/
       week_view.py / month_view.py / day_cell.py
-      todo_dialog.py / settings_dialog.py
+      todo_dialog.py / todo_list_window.py / settings_dialog.py
 ```
 
 ---
@@ -204,7 +254,9 @@ desktopcalendar/
 | `MainWindow` | UI 壳、事件过滤缩放、配置落盘、置底 |
 | `ConfigStore` | `get`/`set`/`load`/`save`；session 优先 |
 | `HolidayService` | `ensure_years`、`holidays_for`、`set_countries` |
-| `TodoStore` | 按日 CRUD + `toggle` |
-| `SettingsDialog` | 国家多选、方案单选实时预览、透明度 |
+| `TodoStore` | 计划 CRUD、重复展开、`toggle` 按日完成 |
+| `TodoListStore` / `TodoListWindow` | 今日计划操作台（投影当日计划、打卡与删当日） |
+| `ICloudCalendarSync` | CalDAV 连接、VEVENT 推送/拉取对账 |
+| `SettingsDialog` | 国家、配色、透明度、iCloud 同步 |
 
 改默认外观或首次几何：编辑 `data/config.json` 的 **`defaults`**；清空 **`session`** 即可下次用默认启动。
