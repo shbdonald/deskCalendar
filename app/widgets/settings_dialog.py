@@ -201,6 +201,11 @@ class SettingsDialog(QDialog):
         self.todolist_visible.setChecked(bool(icloud.get("todolist_visible", True)))
         self.todolist_visible.toggled.connect(lambda _c: self._emit_changed())
         lay.addWidget(self.todolist_visible)
+
+        self.start_with_windows = QCheckBox("开机时自动启动")
+        self.start_with_windows.setChecked(bool(icloud.get("start_with_windows", False)))
+        self.start_with_windows.toggled.connect(lambda _c: self._emit_changed())
+        lay.addWidget(self.start_with_windows)
         return page
 
     def _build_holiday_tab(
@@ -920,6 +925,9 @@ class SettingsDialog(QDialog):
 
     def show_todolist(self) -> bool:
         return self.todolist_visible.isChecked()
+
+    def start_on_boot(self) -> bool:
+        return self.start_with_windows.isChecked()
 
     def closeEvent(self, event) -> None:  # noqa: ANN001
         if self._debounce.isActive():

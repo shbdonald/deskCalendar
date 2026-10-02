@@ -317,6 +317,13 @@ class ICloudCalendarSync:
             cached = self._load_calendars_cache()
             if cached:
                 return cached
+            # Opening settings must never block the UI on network.
+            creds = self.load_credentials()
+            if not str(creds.get("apple_id", "")).strip() or not str(
+                creds.get("app_password", "")
+            ).strip():
+                return []
+            return []
         return self.refresh_calendars()
 
     def _save_calendars_cache(self, items: list[CalendarInfo]) -> None:

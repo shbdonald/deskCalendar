@@ -33,9 +33,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app.services import autostart
 from app.services.calendar_math import get_month_grid, get_week_dates
 from app.services.config_store import ConfigStore
-from app.services.desktop_embed import send_to_bottom
+from app.services.desktop_embed import send_to_bottom, set_topmost
 from app.services.holiday_service import HolidayService
 from app.services.layout_metrics import (
     MIN_WEEK,
@@ -285,6 +286,10 @@ class MainWindow(QMainWindow):
         self._icloud_timer = QTimer(self)
         self._icloud_timer.timeout.connect(self._icloud_poll)
         self._reload_icloud_timer()
+
+        # Refresh Run key path if preference is on (e.g. portable folder moved).
+        if bool(self.config.get("start_with_windows", False)):
+            autostart.sync_from_preference(True)
 
         self._init_todolist_window()
 
@@ -1568,9 +1573,27 @@ class MainWindow(QMainWindow):
             calendars=self._enabled_calendars_for_ui(),
             default_calendar_id=self._icloud_default_calendar_id(),
             on_create_calendar=self._create_calendar_sync,
-            parent=self,
+            parent=None,
         )
-        if dlg.exec() != TodoEditDialog.DialogCode.Accepted:
+        dlg.setWindowModality(Qt.WindowModality.ApplicationModal)
+        dlg.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        if hasattr(self, "_bottom_timer"):
+            self._bottom_timer.stop()
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if screen is not None:
+            ag = screen.availableGeometry()
+            dlg.adjustSize()
+            geo = dlg.frameGeometry()
+            geo.moveCenter(ag.center())
+            dlg.move(geo.topLeft())
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+        accepted = dlg.exec() == TodoEditDialog.DialogCode.Accepted
+        if hasattr(self, "_bottom_timer") and self.isVisible():
+            self._bottom_timer.start()
+            self._pin_to_desktop()
+        if not accepted:
             return
         try:
             if dlg.deleted:
@@ -1625,14 +1648,32 @@ class MainWindow(QMainWindow):
         self.refresh_views()
 
     def _on_day_add(self, day: date) -> None:
+        if hasattr(self, "_bottom_timer"):
+            self._bottom_timer.stop()
         dlg = TodoEditDialog(
             day,
             calendars=self._enabled_calendars_for_ui(),
             default_calendar_id=self._icloud_default_calendar_id(),
             on_create_calendar=self._create_calendar_sync,
-            parent=self,
+            parent=None,
         )
-        if dlg.exec() != TodoEditDialog.DialogCode.Accepted:
+        dlg.setWindowModality(Qt.WindowModality.ApplicationModal)
+        dlg.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if screen is not None:
+            ag = screen.availableGeometry()
+            dlg.adjustSize()
+            geo = dlg.frameGeometry()
+            geo.moveCenter(ag.center())
+            dlg.move(geo.topLeft())
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+        accepted = dlg.exec() == TodoEditDialog.DialogCode.Accepted
+        if hasattr(self, "_bottom_timer") and self.isVisible():
+            self._bottom_timer.start()
+            self._pin_to_desktop()
+        if not accepted:
             return
         try:
             if dlg.repeat_mode == REPEAT_NONE:
@@ -2370,12 +2411,33 @@ class MainWindow(QMainWindow):
             f"已删除本地计划 {n} 条。" if n else "本地没有可清除的计划。",
         )
 
+    def _apply_start_with_windows(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        self.config.set("start_with_windows", enabled, persist=False)
+        try:
+            autostart.set_enabled(enabled)
+        except OSError as exc:
+            QMessageBox.warning(self, "开机启动", f"无法写入开机启动项：{exc}")
+
     def _open_settings(self) -> None:
+        existing = getattr(self, "_settings_dlg", None)
+        if existing is not None:
+            try:
+                if existing.isVisible():
+                    existing.raise_()
+                    existing.activateWindow()
+                    return
+            except RuntimeError:
+                self._settings_dlg = None
+
         creds = self.icloud.load_credentials()
-        cached = [
-            {"id": c.id, "name": c.name, "writable": c.writable}
-            for c in self.icloud.list_calendars(use_cache=True)
-        ]
+        try:
+            cached = [
+                {"id": c.id, "name": c.name, "writable": c.writable}
+                for c in self.icloud.list_calendars(use_cache=True)
+            ]
+        except Exception:  # noqa: BLE001
+            cached = []
 
         dlg = SettingsDialog(
             countries=self.holidays.countries(),
@@ -2392,6 +2454,7 @@ class MainWindow(QMainWindow):
                 "calendars": cached,
                 "poll_seconds": int(self.config.get("icloud_poll_seconds", 45) or 45),
                 "todolist_visible": bool(self.config.get("todolist_visible", True)),
+                "start_with_windows": bool(self.config.get("start_with_windows", False)),
             },
             on_icloud_test=self._icloud_test_from_dialog,
             on_icloud_sync_now=self._icloud_sync_now_from_dialog,
@@ -2406,6 +2469,22 @@ class MainWindow(QMainWindow):
             on_clear_plans=self._clear_local_plans_from_dialog,
             parent=None,
         )
+        dlg.setWindowFlags(
+            Qt.WindowType.Dialog
+            | Qt.WindowType.WindowTitleHint
+            | Qt.WindowType.WindowCloseButtonHint
+            | Qt.WindowType.WindowStaysOnTopHint
+        )
+        dlg.setWindowModality(Qt.WindowModality.ApplicationModal)
+        self._settings_dlg = dlg
+        self.settings_btn.setEnabled(False)
+
+        def _raise_settings() -> None:
+            if not dlg.isVisible():
+                return
+            dlg.raise_()
+            dlg.activateWindow()
+            set_topmost(int(dlg.winId()), True)
 
         def apply_now() -> None:
             countries = dlg.selected_countries() or ["CN"]
@@ -2419,20 +2498,49 @@ class MainWindow(QMainWindow):
             self._ensure_holiday_years()
             self._icloud_apply_settings_dict(dlg.icloud_settings())
             self._set_todolist_visible(dlg.show_todolist(), persist=True)
+            self._apply_start_with_windows(dlg.start_on_boot())
             self.refresh_views()
             self._save_config()
-            self._pin_to_desktop()
+            # Don't pin calendar while settings is open — keeps dialog visible.
             self._dock_todolist()
+            _raise_settings()
 
         dlg.set_on_changed(apply_now)
         self.holidays.countries_refreshed.connect(dlg.replace_countries)
         self.holidays.refresh_available_from_api_async()
 
         def on_finished(_code: int = 0) -> None:
+            if getattr(self, "_settings_dlg", None) is dlg:
+                self._settings_dlg = None
+            self.settings_btn.setEnabled(True)
             try:
                 self.holidays.countries_refreshed.disconnect(dlg.replace_countries)
             except (TypeError, RuntimeError):
                 pass
+            try:
+                set_topmost(int(dlg.winId()), False)
+            except Exception:  # noqa: BLE001
+                pass
 
         dlg.finished.connect(on_finished)
+
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if screen is not None:
+            ag = screen.availableGeometry()
+            dlg.resize(520, 600)
+            geo = dlg.frameGeometry()
+            geo.moveCenter(ag.center())
+            dlg.move(geo.topLeft())
+
+        # Pause HWND_BOTTOM reinforce so the dialog is not buried.
+        if hasattr(self, "_bottom_timer"):
+            self._bottom_timer.stop()
+        dlg.show()
+        _ = dlg.winId()
+        _raise_settings()
+        QTimer.singleShot(0, _raise_settings)
+        QTimer.singleShot(50, _raise_settings)
         dlg.exec()
+        if hasattr(self, "_bottom_timer") and self.isVisible():
+            self._bottom_timer.start()
+            self._pin_to_desktop()

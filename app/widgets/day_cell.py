@@ -364,6 +364,9 @@ class DayCell(QFrame):
         # 还有更多时先给「+N」留独立空间，避免被计划行挡住
         if total > min(soft_cap, n_fit):
             n_fit = max(0, (avail - self._more_label_height()) // pitch)
+        # 有计划但高度紧（假日占位等）时至少挤出 1 条，避免整格空白
+        if total > 0 and n_fit <= 0 and avail >= 12:
+            n_fit = 1
         return min(soft_cap, n_fit)
 
     def _todo_line_pitch(self) -> int:

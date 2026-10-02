@@ -590,7 +590,8 @@ class TodoListWindow(QWidget):
 
     def hideEvent(self, event) -> None:  # noqa: ANN001
         super().hideEvent(event)
-        if self.isHidden():
+        # 仅用户点「×」隐藏时持久化；退出/托盘/程序 force_hide 不算「用户关闭待办」
+        if self.isHidden() and not self._allow_programmatic_hide:
             self.visibility_changed.emit(False)
 
     def hide(self) -> None:

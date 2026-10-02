@@ -33,6 +33,7 @@
     "icloud_calendars_enabled_names": [],
     "icloud_default_calendar_id": "",
     "todolist_visible": true,
+    "start_with_windows": false,
     "todolist_x": 345,
     "todolist_y": 165,
     "todolist_w": 300,

@@ -1,0 +1,38 @@
+---
+description: 修改程序后若要加载/运行，必须先结束旧进程再启动
+alwaysApply: true
+---
+
+# 修改程序后加载前必须先结束进程
+
+**硬性要求：** 每次你修改了本程序代码，并且需要加载/运行程序（验证、预览、测试 UI）时：
+
+1. **先结束**所有相关进程，禁止在旧进程仍在跑时再开一个：
+   - `python` / `pythonw`，且命令行包含本仓库的 `main.py` 或 `desktopcalendar`
+   - 以及任何 `DesktopCalendar.exe`
+2. 稍等约 0.5–1 秒
+3. 再从仓库根目录启动：`python main.py`（后台）
+
+优先使用（内部已包含结束 + 启动）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\restart_app.ps1
+```
+
+`main.py` 启动时也会按 `userdata/instance.pid` 结束旧实例；改码后仍优先用上面的脚本，避免启动失败时留下陈旧进程。
+
+## 何时必须做
+
+- 改完 `app/`、`main.py` 或其它会影响运行时的文件，且本回合需要看到效果 / 跑起来验证
+- 任何「再启动一次」「加载程序」「测试运行」的操作
+
+## 何时可跳过
+
+- 用户明确说不要重启
+- 仅改文档（如 README）且无运行时影响
+- 本回合只改代码、用户未要求运行，且你也不需要启动程序验证
+
+## 禁止
+
+- 不先杀进程就直接 `python main.py` / 启动 exe
+- 同时存在多个本程序实例
