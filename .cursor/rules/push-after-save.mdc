@@ -1,0 +1,23 @@
+---
+description: 保存版本（git commit）后必须同步推送到 GitHub
+alwaysApply: true
+---
+
+# 保存版本后推送 GitHub
+
+当用户要求「保存版本 / 提交 / commit」时：
+
+1. 按既有 git 安全协议完成 `git add` + `git commit`
+2. **同一回合内**立刻 `git push -u origin HEAD`（或当前跟踪分支的 `git push`）
+3. 用 `git status -sb` 确认本地与 `origin` 同步（不应再显示 ahead）
+4. 回复中给出提交哈希，并说明已推送到 GitHub
+
+## 例外
+
+- 用户明确说「只本地提交、先别推」
+- `git push` 失败时：报告错误，不要强推（`--force`），除非用户明确要求
+
+## 远程
+
+默认远程：`origin` → https://github.com/shbdonald/deskCalendar.git  
+默认分支：`main`
