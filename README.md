@@ -3,6 +3,8 @@
 Windows 桌面日历小组件，基于 **Python + PySide6**。  
 默认显示本周（周日→周六），可展开为本月；格内显示计划与多国节假日。窗口置底、可锁定；出厂配置在 `data/`，个人数据在 `userdata/`。
 
+**版本改进一览：** 见 [CHANGELOG.md](CHANGELOG.md)。
+
 回滚到加「重复计划」之前的版本：
 
 ```bash

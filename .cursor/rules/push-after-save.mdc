@@ -7,14 +7,16 @@ alwaysApply: true
 
 当用户要求「保存版本 / 提交 / commit」时：
 
-1. 按既有 git 安全协议完成 `git add` + `git commit`
-2. **同一回合内**立刻 `git push -u origin HEAD`（或当前跟踪分支的 `git push`）
-3. 用 `git status -sb` 确认本地与 `origin` 同步（不应再显示 ahead）
-4. 回复中给出提交哈希，并说明已推送到 GitHub
+1. 若有用户能感知的功能或修复：先在 `CHANGELOG.md` **最上方**补一节（日期、标题、提交前可写「待填哈希」，commit 后再改成短哈希亦可在同一提交内写好说明）
+2. 按既有 git 安全协议完成 `git add` + `git commit`（含更新后的 `CHANGELOG.md`）
+3. **同一回合内**立刻 `git push -u origin HEAD`（或当前跟踪分支的 `git push`）
+4. 用 `git status -sb` 确认本地与 `origin` 同步（不应再显示 ahead）
+5. 回复中给出提交哈希，并说明已推送到 GitHub；可附 CHANGELOG 小节标题
 
 ## 例外
 
 - 用户明确说「只本地提交、先别推」
+- 纯规则/文档微调且用户未要求写 CHANGELOG 时，可只推送、不强行加空节
 - `git push` 失败时：报告错误，不要强推（`--force`），除非用户明确要求
 
 ## 远程
