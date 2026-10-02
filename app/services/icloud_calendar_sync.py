@@ -226,6 +226,44 @@ class ICloudCalendarSync:
             path.unlink()
         self.disconnect()
 
+    def clear_calendars_cache(self) -> None:
+        path = self.calendars_cache_path()
+        if path.exists():
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        self._calendars.clear()
+        self._calendar_meta.clear()
+
+    def replace_calendars_cache(self, items: list[dict[str, Any]] | list[CalendarInfo]) -> None:
+        """覆盖本地日历缓存（用于退出账号后只保留勾选日历名称）。"""
+        out: list[CalendarInfo] = []
+        for item in items or []:
+            if isinstance(item, CalendarInfo):
+                if item.id and item.name:
+                    out.append(item)
+                continue
+            if not isinstance(item, dict):
+                continue
+            cid = str(item.get("id") or "").strip()
+            name = str(item.get("name") or "").strip()
+            if not cid or not name or cid == "local" or cid.startswith("local:"):
+                continue
+            out.append(
+                CalendarInfo(
+                    id=cid,
+                    name=name,
+                    writable=bool(item.get("writable", True)),
+                    url=str(item.get("url") or ""),
+                )
+            )
+        self._calendars.clear()
+        self._calendar_meta.clear()
+        for info in out:
+            self._calendar_meta[info.id] = info
+        self._save_calendars_cache(out)
+
     def disconnect(self) -> None:
         self._client = None
         self._principal = None

@@ -232,6 +232,18 @@ class TodoStore:
     def all_plans(self) -> list[dict[str, Any]]:
         return list(self._plans)
 
+    def plan_counts_by_calendar(self) -> dict[str, int]:
+        """按 calendar_id 与 calendar_name 分别累计计划条数（可同时用两者查）。"""
+        counts: dict[str, int] = {}
+        for plan in self._plans:
+            cid = str(plan.get("calendar_id") or "").strip()
+            cname = str(plan.get("calendar_name") or "").strip()
+            if cid:
+                counts[cid] = counts.get(cid, 0) + 1
+            if cname:
+                counts[cname] = counts.get(cname, 0) + 1
+        return counts
+
     def get_plan(self, item_id: str) -> dict[str, Any] | None:
         plan = self._find(item_id)
         return dict(plan) if plan else None
@@ -598,3 +610,27 @@ class TodoStore:
             self._plans = []
             self.save()
         return n
+
+    def clear_by_calendars(
+        self,
+        calendar_ids: list[str] | None = None,
+        calendar_names: list[str] | None = None,
+    ) -> int:
+        """按日历 id/名称删除本地计划，返回删除条数。"""
+        ids = {str(x) for x in (calendar_ids or []) if x}
+        names = {str(x).strip() for x in (calendar_names or []) if str(x).strip()}
+        if not ids and not names:
+            return 0
+        keep: list[dict[str, Any]] = []
+        removed = 0
+        for plan in self._plans:
+            cid = str(plan.get("calendar_id") or "")
+            cname = str(plan.get("calendar_name") or "").strip()
+            if (cid and cid in ids) or (cname and cname in names):
+                removed += 1
+                continue
+            keep.append(plan)
+        if removed:
+            self._plans = keep
+            self.save()
+        return removed

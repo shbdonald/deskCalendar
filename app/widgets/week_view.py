@@ -6,7 +6,7 @@ from typing import Callable
 
 from PySide6.QtWidgets import QGridLayout, QSizePolicy, QWidget
 
-from app.services.calendar_math import get_week_dates
+from app.services.calendar_math import DEFAULT_WEEK_STARTS_ON, get_week_dates
 from app.widgets.day_cell import DayCell
 
 
@@ -61,9 +61,11 @@ class WeekView(QWidget):
         holiday_fn: Callable[[date], list],
         todo_fn: Callable[[date], list],
         theme: dict | None = None,
+        *,
+        week_starts_on: int = DEFAULT_WEEK_STARTS_ON,
     ) -> None:
         self._ensure_cells(theme)
-        for i, d in enumerate(get_week_dates(ref)):
+        for i, d in enumerate(get_week_dates(ref, week_starts_on=week_starts_on)):
             cell = self._cells[i]
             cell.apply_day(d, in_month=True, theme=theme)
             cell.set_content(holiday_fn(d), todo_fn(d))

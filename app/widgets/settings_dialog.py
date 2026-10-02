@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QFormLayout,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -26,7 +27,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app.services.calendar_math import WEEKDAY_NAMES_CN, normalize_week_starts_on
 from app.services.icloud_calendar_sync import DEFAULT_CALENDAR_NAME
+from app.services.local_calendar import (
+    LOCAL_CALENDAR_ID,
+    LOCAL_CALENDAR_NAME,
+    is_local_calendar_id,
+    with_local_calendar,
+)
 from app.services.theme import (
     THEME_PRESET_LABELS,
     THEME_PRESETS,
@@ -35,6 +43,63 @@ from app.services.theme import (
     preset_swatches,
     preset_theme,
 )
+
+_COL_SHOW_W = 56
+_COL_SYNC_W = 56
+
+
+class _CalendarListRow(QWidget):
+    """一整行：名称 + 显示 + 同步；鼠标悬停时整行高亮。"""
+
+    def __init__(self, *, alt: bool = False, parent=None) -> None:
+        super().__init__(parent)
+        self._alt = alt
+        # 自定义 Python 类名不能当 QSS 类型选择器；用 objectName + StyledBackground
+        self.setObjectName("calListRow")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        self.name_lbl = QLabel()
+        self.name_lbl.setWordWrap(False)
+        self.name_lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.name_lbl.setStyleSheet(
+            "QLabel { background:transparent; color:#EEF2F6; padding:7px 8px; border:none; }"
+        )
+        lay.addWidget(self.name_lbl, 1)
+
+        self.show_cb = QCheckBox()
+        self.show_cb.setFixedWidth(_COL_SHOW_W)
+        self.show_cb.setStyleSheet(
+            "QCheckBox { background:transparent; padding:6px 12px; border:none; }"
+        )
+        lay.addWidget(self.show_cb, 0, Qt.AlignmentFlag.AlignCenter)
+
+        self.sync_cb = QCheckBox()
+        self.sync_cb.setFixedWidth(_COL_SYNC_W)
+        self.sync_cb.setStyleSheet(
+            "QCheckBox { background:transparent; padding:6px 12px; border:none; }"
+        )
+        lay.addWidget(self.sync_cb, 0, Qt.AlignmentFlag.AlignCenter)
+        self._apply_style()
+
+    def _apply_style(self) -> None:
+        bg = "#1E252E" if self._alt else "#181E26"
+        # :hover 在子控件上仍生效；勿用 enter/leave（移入勾选框会误 leave）
+        self.setStyleSheet(
+            f"""
+            QWidget#calListRow {{
+                background-color: {bg};
+                border: 1px solid #2A3340;
+            }}
+            QWidget#calListRow:hover {{
+                background-color: #2A3F5C;
+                border: 1px solid #4A9BFF;
+            }}
+            """
+        )
 
 
 class SettingsDialog(QDialog):
@@ -55,14 +120,16 @@ class SettingsDialog(QDialog):
         | None = None,
         on_icloud_create_calendar: Callable[[dict, str, Callable[[bool, object], None]], None]
         | None = None,
-        on_icloud_set_enabled_calendars: Callable[[list[str], str, list[str]], None]
+        on_icloud_set_enabled_calendars: Callable[
+            [list[str], str, list[str], list[str], list[str]], None
+        ]
         | None = None,
-        on_clear_plans: Callable[[], None] | None = None,
+        on_clear_plans: Callable[[list[str], list[str]], None] | None = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("设置")
-        self.setMinimumSize(480, 560)
+        self.setMinimumSize(500, 600)
         self.setWindowFlags(
             self.windowFlags()
             | Qt.WindowType.Window
@@ -84,7 +151,25 @@ class SettingsDialog(QDialog):
             icloud.get("calendar_name", DEFAULT_CALENDAR_NAME) or DEFAULT_CALENDAR_NAME
         )
         self._calendar_checks: dict[str, QCheckBox] = {}
+        self._calendar_sync_checks: dict[str, QCheckBox] = {}
+        # 表头三态循环用：记住「本来勾选」以便从全不选恢复
+        self._show_keep_ids: set[str] | None = None
+        self._sync_keep_ids: set[str] | None = None
         self._calendar_names: dict[str, str] = {}
+        raw_counts = icloud.get("calendar_plan_counts") or {}
+        self._calendar_plan_counts: dict[str, int] = {
+            str(k): int(v)
+            for k, v in (raw_counts.items() if isinstance(raw_counts, dict) else [])
+            if str(k) and int(v) >= 0
+        }
+        self._sync_enabled_ids: set[str] = {
+            str(x) for x in (icloud.get("calendars_sync") or []) if x
+        }
+        self._extra_local_calendars: list[dict[str, str]] = [
+            {"id": str(it.get("id")), "name": str(it.get("name"))}
+            for it in (icloud.get("local_calendars") or [])
+            if isinstance(it, dict) and it.get("id") and it.get("name")
+        ]
         self._checks: dict[str, QCheckBox] = {}
         # 账号：empty | editing | locked
         self._account_mode = "empty"
@@ -197,6 +282,19 @@ class SettingsDialog(QDialog):
         op_row.addRow("不透明度", op_wrap)
         lay.addLayout(op_row)
 
+        week_row = QFormLayout()
+        self.week_starts_on = QComboBox()
+        for i, name in enumerate(WEEKDAY_NAMES_CN):
+            self.week_starts_on.addItem(name, i)
+        cur_start = normalize_week_starts_on(icloud.get("week_starts_on", 6))
+        idx = self.week_starts_on.findData(cur_start)
+        if idx >= 0:
+            self.week_starts_on.setCurrentIndex(idx)
+        self.week_starts_on.setToolTip("周视图与月视图表头的一周起点")
+        self.week_starts_on.currentIndexChanged.connect(lambda _i: self._emit_changed())
+        week_row.addRow("每周第一天", self.week_starts_on)
+        lay.addLayout(week_row)
+
         self.todolist_visible = QCheckBox("显示今日待办窗口")
         self.todolist_visible.setChecked(bool(icloud.get("todolist_visible", True)))
         self.todolist_visible.toggled.connect(lambda _c: self._emit_changed())
@@ -229,27 +327,48 @@ class SettingsDialog(QDialog):
         lay.addWidget(scroll, 1)
         return page
 
+    def _section_label(self, text: str) -> QLabel:
+        lbl = QLabel(text)
+        lbl.setStyleSheet(
+            "color:#A8B0BC; font-size:11px; font-weight:600; letter-spacing:0.5px;"
+        )
+        return lbl
+
+    def _thin_divider(self) -> QFrame:
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.HLine)
+        line.setFixedHeight(1)
+        line.setStyleSheet("background:#2A3340; border:none; max-height:1px;")
+        return line
+
     def _build_icloud_tab(self, icloud: dict) -> QWidget:
         page = QWidget()
         lay = QVBoxLayout(page)
-        lay.setSpacing(8)
+        lay.setContentsMargins(4, 6, 4, 4)
+        lay.setSpacing(10)
 
         help_lbl = QLabel(
-            "使用 Apple「应用专用密码」。校验通过后勾选要同步的日历；"
-            "通讯录「生日」等只读日历不会列出。公共假日仍由 Nager 显示。"
+            "使用 Apple「应用专用密码」。通讯录生日等只读日历不会列出；公共假日仍由 Nager 显示。"
         )
         help_lbl.setWordWrap(True)
-        help_lbl.setStyleSheet("color:#A8B0BC; font-size:11px;")
+        help_lbl.setStyleSheet("color:#8B97A8; font-size:11px;")
         lay.addWidget(help_lbl)
 
-        # —— 账号区：添加账号 / 输入+校验 / 锁定+修改 ——
-        self._add_account_btn = QPushButton("添加账号")
+        # —— 账号 ——
+        lay.addWidget(self._section_label("账号"))
+        self._add_account_btn = QPushButton("添加 Apple 账号")
+        self._add_account_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._add_account_btn.clicked.connect(self._on_add_account)
         lay.addWidget(self._add_account_btn)
 
         self._account_form_widget = QWidget()
         account_form = QFormLayout(self._account_form_widget)
         account_form.setContentsMargins(0, 0, 0, 0)
+        account_form.setHorizontalSpacing(12)
+        account_form.setVerticalSpacing(8)
+        account_form.setFieldGrowthPolicy(
+            QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow
+        )
 
         self.icloud_apple_id = QLineEdit()
         self.icloud_apple_id.setPlaceholderText("Apple ID 邮箱")
@@ -258,14 +377,16 @@ class SettingsDialog(QDialog):
 
         self.icloud_password = QLineEdit()
         self.icloud_password.setEchoMode(QLineEdit.EchoMode.Password)
-        self.icloud_password.setPlaceholderText("应用专用密码")
+        self.icloud_password.setPlaceholderText("应用专用密码（不是登录密码）")
         self.icloud_password.setText(str(icloud.get("app_password", "")))
         account_form.addRow("专用密码", self.icloud_password)
 
         cred_btn_row = QHBoxLayout()
+        cred_btn_row.setContentsMargins(0, 0, 0, 0)
+        cred_btn_row.setSpacing(8)
         self._cred_action_btn = QPushButton("校验")
         self._cred_action_btn.clicked.connect(self._on_cred_action)
-        self._clear_account_btn = QPushButton("清除账号密码")
+        self._clear_account_btn = QPushButton("清除账号")
         self._clear_account_btn.setToolTip("删除已保存的 Apple ID 与专用密码")
         self._clear_account_btn.clicked.connect(self._on_clear_account)
         self._clear_account_btn.setVisible(False)
@@ -275,11 +396,26 @@ class SettingsDialog(QDialog):
         account_form.addRow("", cred_btn_row)
         lay.addWidget(self._account_form_widget)
 
-        icloud_form = QFormLayout()
+        lay.addWidget(self._thin_divider())
+
+        # —— 同步 ——
+        lay.addWidget(self._section_label("同步"))
+        sync_bar = QHBoxLayout()
+        sync_bar.setContentsMargins(0, 0, 0, 0)
+        sync_bar.setSpacing(10)
         self.icloud_enabled = QCheckBox("启用同步")
         self.icloud_enabled.setChecked(bool(icloud.get("enabled", False)))
-        self.icloud_enabled.toggled.connect(lambda _c: self._emit_changed())
-        icloud_form.addRow("", self.icloud_enabled)
+        self.icloud_enabled.setToolTip(
+            "总开关：关闭后不进行任何 iCloud 轮询/推送；\n"
+            "打开后仅同步下方勾了「同步」的日历。"
+        )
+        self.icloud_enabled.toggled.connect(self._on_master_sync_toggled)
+        sync_bar.addWidget(self.icloud_enabled)
+        sync_bar.addStretch(1)
+
+        poll_lbl = QLabel("轮询间隔")
+        poll_lbl.setStyleSheet("color:#A8B0BC; font-size:12px;")
+        sync_bar.addWidget(poll_lbl)
 
         self.icloud_poll = QSpinBox()
         self.icloud_poll.setRange(15, 600)
@@ -288,11 +424,9 @@ class SettingsDialog(QDialog):
         self.icloud_poll.setValue(int(icloud.get("poll_seconds", 45) or 45))
         self.icloud_poll.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
         self.icloud_poll.setAccelerated(True)
+        self.icloud_poll.setFixedWidth(88)
         self.icloud_poll.valueChanged.connect(lambda _v: self._emit_changed())
-        poll_row = QHBoxLayout()
-        poll_row.setContentsMargins(0, 0, 0, 0)
-        poll_row.setSpacing(4)
-        poll_row.addWidget(self.icloud_poll, 1)
+        sync_bar.addWidget(self.icloud_poll)
         self._poll_down = QToolButton()
         self._poll_down.setText("−")
         self._poll_down.setToolTip("减少间隔")
@@ -306,38 +440,100 @@ class SettingsDialog(QDialog):
             btn.setAutoRepeatDelay(400)
             btn.setAutoRepeatInterval(60)
             btn.setFixedSize(28, 28)
-            poll_row.addWidget(btn)
-        icloud_form.addRow("轮询间隔", poll_row)
-        lay.addLayout(icloud_form)
+            sync_bar.addWidget(btn)
+        lay.addLayout(sync_bar)
 
+        sync_actions = QHBoxLayout()
+        sync_actions.setContentsMargins(0, 0, 0, 0)
+        sync_actions.setSpacing(8)
+        self._icloud_sync_btn = QPushButton("立即同步")
+        self._icloud_sync_btn.clicked.connect(self._on_sync_now)
+        self._icloud_busy_label = QLabel("")
+        self._icloud_busy_label.setStyleSheet("color:#FBBF24; font-size:11px;")
+        sync_actions.addWidget(self._icloud_sync_btn)
+        sync_actions.addWidget(self._icloud_busy_label, 1)
+        lay.addLayout(sync_actions)
+
+        lay.addWidget(self._thin_divider())
+
+        # —— 日历 ——
+        lay.addWidget(self._section_label("日历"))
         cal_header = QHBoxLayout()
-        cal_header.addWidget(QLabel("同步日历（可多选）"), 1)
-        self._cal_refresh_btn = QPushButton("刷新列表")
+        cal_header.setContentsMargins(0, 0, 0, 0)
+        cal_header.setSpacing(8)
+        cal_tip = QLabel("显示 = 主界面可见；同步 = 与 iCloud 双向（本地除外）")
+        cal_tip.setStyleSheet("color:#8B97A8; font-size:11px;")
+        cal_tip.setWordWrap(True)
+        cal_header.addWidget(cal_tip, 1)
+        self._cal_refresh_btn = QPushButton("刷新")
+        self._cal_refresh_btn.setToolTip("从 iCloud 刷新日历列表")
         self._cal_refresh_btn.clicked.connect(self._on_refresh_calendars)
         cal_header.addWidget(self._cal_refresh_btn)
         lay.addLayout(cal_header)
 
         cal_scroll = QScrollArea()
         cal_scroll.setWidgetResizable(True)
-        cal_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
-        cal_scroll.setMinimumHeight(100)
-        cal_scroll.setMaximumHeight(180)
+        cal_scroll.setFrameShape(QScrollArea.Shape.StyledPanel)
+        cal_scroll.setStyleSheet(
+            "QScrollArea { border:1px solid #445; border-radius:2px; background:#151A20; }"
+        )
+        cal_scroll.setMinimumHeight(140)
         self._cal_holder = QWidget()
+        self._cal_holder.setStyleSheet("background:#151A20;")
         self._cal_form = QVBoxLayout(self._cal_holder)
-        self._cal_form.setContentsMargins(0, 0, 4, 0)
+        self._cal_form.setContentsMargins(6, 4, 6, 4)
+        self._cal_form.setSpacing(2)
+
+        hdr = QWidget()
+        hdr_lay = QHBoxLayout(hdr)
+        hdr_lay.setContentsMargins(0, 0, 0, 0)
+        hdr_lay.setSpacing(0)
+        name_h = QLabel("名称")
+        name_h.setStyleSheet(
+            "color:#A8B0BC; font-size:11px; font-weight:600; padding:4px 6px;"
+        )
+        hdr_lay.addWidget(name_h, 1)
+        self._show_all_cb = QCheckBox("显示")
+        self._show_all_cb.setFixedWidth(_COL_SHOW_W)
+        self._show_all_cb.setTristate(False)
+        self._show_all_cb.setToolTip("点击循环：全选 → 全不选 → 恢复原先勾选")
+        self._show_all_cb.clicked.connect(self._on_show_all_toggled)
+        self._sync_all_cb = QCheckBox("同步")
+        self._sync_all_cb.setFixedWidth(_COL_SYNC_W)
+        self._sync_all_cb.setTristate(False)
+        self._sync_all_cb.setToolTip("点击循环：全选 → 全不选 → 恢复原先勾选（本地日历除外）")
+        self._sync_all_cb.clicked.connect(self._on_sync_all_toggled)
+        for cb in (self._show_all_cb, self._sync_all_cb):
+            cb.setStyleSheet(
+                "QCheckBox { color:#A8B0BC; font-size:11px; font-weight:600; spacing:2px; }"
+            )
+        hdr_lay.addWidget(self._show_all_cb, 0, Qt.AlignmentFlag.AlignCenter)
+        hdr_lay.addWidget(self._sync_all_cb, 0, Qt.AlignmentFlag.AlignCenter)
+        self._cal_form.addWidget(hdr)
+
+        self._cal_rows = QVBoxLayout()
+        self._cal_rows.setContentsMargins(0, 0, 0, 0)
+        self._cal_rows.setSpacing(2)
+        self._cal_form.addLayout(self._cal_rows)
+        self._cal_form.addStretch(1)
         cal_scroll.setWidget(self._cal_holder)
-        lay.addWidget(cal_scroll)
+        lay.addWidget(cal_scroll, 1)
 
         new_row = QHBoxLayout()
+        new_row.setContentsMargins(0, 0, 0, 0)
+        new_row.setSpacing(8)
         self._new_cal_name = QLineEdit()
-        self._new_cal_name.setPlaceholderText("新建日历名称")
+        self._new_cal_name.setPlaceholderText("新建日历名称（可不登录）")
         self._new_cal_btn = QPushButton("新建")
+        self._new_cal_btn.setFixedWidth(64)
         self._new_cal_btn.clicked.connect(self._on_create_calendar)
         new_row.addWidget(self._new_cal_name, 1)
         new_row.addWidget(self._new_cal_btn)
         lay.addLayout(new_row)
 
         default_row = QFormLayout()
+        default_row.setContentsMargins(0, 0, 0, 0)
+        default_row.setHorizontalSpacing(12)
         self.default_calendar = QComboBox()
         self.default_calendar.setMinimumWidth(160)
         self.default_calendar.currentIndexChanged.connect(lambda _i: self._emit_changed())
@@ -347,32 +543,80 @@ class SettingsDialog(QDialog):
         enabled = [str(x) for x in (icloud.get("calendars_enabled") or []) if x]
         default_id = str(icloud.get("default_calendar_id") or "")
         calendars = icloud.get("calendars") or []
-        if isinstance(calendars, list) and calendars:
-            self._fill_calendars(calendars, set(enabled), default_id)
-        else:
-            empty = QLabel("校验账号后将拉取可同步日历")
-            empty.setStyleSheet("color:#A8B0BC; font-size:11px;")
-            self._cal_form.addWidget(empty)
-            self._cal_form.addStretch(1)
-
-        sync_row = QHBoxLayout()
-        self._icloud_sync_btn = QPushButton("立即同步")
-        self._icloud_sync_btn.clicked.connect(self._on_sync_now)
-        self._icloud_busy_label = QLabel("")
-        self._icloud_busy_label.setStyleSheet("color:#FBBF24; font-size:11px;")
-        sync_row.addWidget(self._icloud_sync_btn)
-        sync_row.addWidget(self._icloud_busy_label, 1)
-        lay.addLayout(sync_row)
-        lay.addStretch(1)
+        if not isinstance(calendars, list):
+            calendars = []
+        calendars = with_local_calendar(
+            calendars, extra_local=self._extra_local_calendars
+        )
+        self._fill_calendars(calendars, set(enabled), default_id)
 
         has_id = bool(str(icloud.get("apple_id", "")).strip())
         has_pw = bool(str(icloud.get("app_password", "")).strip())
         if has_id and has_pw:
-            # 已有账号：视为已校验锁定
             self._set_account_mode("locked", verified=True)
         else:
             self._set_account_mode("empty", verified=False)
+        self._update_sync_master_ui()
         return page
+
+    def _on_master_sync_toggled(self, checked: bool) -> None:
+        if self._suppress:
+            return
+        if checked and not self._creds_verified:
+            QMessageBox.information(
+                self,
+                "提示",
+                "请先添加并校验 Apple 账号，再启用同步。",
+            )
+            self.icloud_enabled.blockSignals(True)
+            self.icloud_enabled.setChecked(False)
+            self.icloud_enabled.blockSignals(False)
+            self._update_sync_master_ui()
+            return
+        if checked:
+            # 打开总开关且尚未勾选任何「同步」时，默认勾上全部可同步日历
+            syncable = [
+                cid
+                for cid, cb in self._calendar_sync_checks.items()
+                if cb.isEnabled() and not is_local_calendar_id(cid)
+            ]
+            if syncable and not any(
+                self._calendar_sync_checks[cid].isChecked() for cid in syncable
+            ):
+                self._suppress = True
+                try:
+                    for cid in syncable:
+                        cb = self._calendar_sync_checks[cid]
+                        cb.blockSignals(True)
+                        cb.setChecked(True)
+                        cb.blockSignals(False)
+                finally:
+                    self._suppress = False
+                self._refresh_column_header_checks()
+                self._cal_filter_debounce.start()
+        self._update_sync_master_ui()
+        self._emit_changed()
+
+    def _update_sync_master_ui(self) -> None:
+        """「启用同步」总开关：关闭时禁用同步列与立即同步。"""
+        master_on = bool(self.icloud_enabled.isChecked()) and self._creds_verified
+        has_syncable = any(
+            not is_local_calendar_id(cid) for cid in self._calendar_sync_checks
+        )
+        if hasattr(self, "_sync_all_cb"):
+            self._sync_all_cb.setEnabled(master_on and has_syncable)
+        for cid, cb in self._calendar_sync_checks.items():
+            if is_local_calendar_id(cid):
+                cb.setEnabled(False)
+                continue
+            cb.setEnabled(master_on)
+        if hasattr(self, "_icloud_sync_btn"):
+            if not getattr(self, "_icloud_busy", False):
+                self._icloud_sync_btn.setEnabled(master_on)
+        if hasattr(self, "icloud_poll"):
+            self.icloud_poll.setEnabled(master_on)
+            self._poll_down.setEnabled(master_on)
+            self._poll_up.setEnabled(master_on)
 
     def _set_account_mode(self, mode: str, *, verified: bool | None = None) -> None:
         self._account_mode = mode
@@ -402,6 +646,7 @@ class SettingsDialog(QDialog):
             self._cred_action_btn.setText("修改")
             self._clear_account_btn.setVisible(True)
             self._creds_verified = True
+        self._update_sync_master_ui()
 
     def _on_add_account(self) -> None:
         self._set_account_mode("editing", verified=False)
@@ -415,6 +660,69 @@ class SettingsDialog(QDialog):
             return
         self._run_credential_verify(reason="manual")
 
+    def _pick_calendars_to_keep(self) -> dict | None:
+        """勾选要保留计划的日历。返回 clear/keep 信息；取消返回 None。"""
+        items: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for cid, name in self._calendar_names.items():
+            if not cid or cid in seen:
+                continue
+            seen.add(cid)
+            items.append((cid, name or cid))
+        if LOCAL_CALENDAR_ID not in seen:
+            items.insert(0, (LOCAL_CALENDAR_ID, LOCAL_CALENDAR_NAME))
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("选择要保留的日历计划")
+        dlg.setMinimumWidth(360)
+        lay = QVBoxLayout(dlg)
+        tip = QLabel(
+            "请勾选【要保留】本地计划的日历。\n\n"
+            "未勾选的日历：其本地计划将被永久删除（不可恢复）。\n"
+            "已勾选的日历：计划会留在本机，并继续在日历上显示。\n\n"
+            "若全部不勾选，将清除所有列出日历下的本地计划；\n"
+            "若全部勾选，则只清除账号，不删除任何计划。"
+        )
+        tip.setWordWrap(True)
+        tip.setStyleSheet("color:#EEF2F6; font-size:13px;")
+        lay.addWidget(tip)
+        checks: dict[str, QCheckBox] = {}
+        for cid, name in items:
+            label = self._calendar_label(cid, name)
+            cb = QCheckBox(f"保留「{label}」")
+            # 默认保留本地日历；iCloud 日历默认不勾（即将断开账号）
+            cb.setChecked(cid == LOCAL_CALENDAR_ID)
+            checks[cid] = cb
+            lay.addWidget(cb)
+        btns = QHBoxLayout()
+        btns.addStretch(1)
+        ok_btn = QPushButton("确定")
+        cancel_btn = QPushButton("取消")
+        ok_btn.clicked.connect(dlg.accept)
+        cancel_btn.clicked.connect(dlg.reject)
+        btns.addWidget(ok_btn)
+        btns.addWidget(cancel_btn)
+        lay.addLayout(btns)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+        keep_ids = [cid for cid, cb in checks.items() if cb.isChecked()]
+        keep_set = set(keep_ids)
+        clear_ids = [cid for cid in checks if cid not in keep_set]
+        name_of = {
+            cid: (
+                self._calendar_names.get(cid)
+                or (LOCAL_CALENDAR_NAME if cid == LOCAL_CALENDAR_ID else cid)
+            )
+            for cid in checks
+        }
+        return {
+            "clear_ids": clear_ids,
+            "clear_names": [name_of[cid] for cid in clear_ids],
+            "keep_ids": keep_ids,
+            "keep_names": [name_of[cid] for cid in keep_ids],
+            "keep_items": [{"id": cid, "name": name_of[cid]} for cid in keep_ids],
+        }
+
     def _on_clear_account(self) -> None:
         reply = QMessageBox.question(
             self,
@@ -426,39 +734,38 @@ class SettingsDialog(QDialog):
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        clear_plans = False
-        plans_reply = QMessageBox.question(
-            self,
-            "清除日历计划",
-            "是否同时清除本地全部日历计划？\n"
-            "选择「是」将删除本机已有计划（不可恢复）；\n"
-            "选择「否」仅清除账号，保留本地计划。",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if plans_reply == QMessageBox.StandardButton.Yes:
-            clear_plans = True
+        picked = self._pick_calendars_to_keep()
+        if picked is None:
+            return
+        clear_ids = list(picked.get("clear_ids") or [])
+        clear_names = list(picked.get("clear_names") or [])
+        keep_ids = [str(x) for x in (picked.get("keep_ids") or []) if x]
+        keep_items = [
+            it
+            for it in (picked.get("keep_items") or [])
+            if isinstance(it, dict) and it.get("id")
+        ]
+        # 至少保留本地日历入口，保证仍可单机新建
+        if LOCAL_CALENDAR_ID not in {str(it.get("id")) for it in keep_items}:
+            keep_items = [
+                {"id": LOCAL_CALENDAR_ID, "name": LOCAL_CALENDAR_NAME},
+                *keep_items,
+            ]
+        enabled = set(keep_ids) | {LOCAL_CALENDAR_ID}
+
+        # 先按选择删计划，再清账号并写回「保留」勾选
+        if clear_ids and self._on_clear_plans:
+            self._on_clear_plans(clear_ids, clear_names)
 
         self.icloud_enabled.setChecked(False)
         self._set_account_mode("empty", verified=False)
-        # 清空日历勾选区
-        while self._cal_form.count():
-            item = self._cal_form.takeAt(0)
-            w = item.widget()
-            if w:
-                w.deleteLater()
-        self._calendar_checks.clear()
-        self._calendar_names.clear()
-        empty = QLabel("校验账号后将拉取可同步日历")
-        empty.setStyleSheet("color:#A8B0BC; font-size:11px;")
-        self._cal_form.addWidget(empty)
-        self._cal_form.addStretch(1)
-        self.default_calendar.blockSignals(True)
-        self.default_calendar.clear()
-        self.default_calendar.blockSignals(False)
+        default_id = (
+            LOCAL_CALENDAR_ID
+            if LOCAL_CALENDAR_ID in enabled
+            else (keep_ids[0] if keep_ids else LOCAL_CALENDAR_ID)
+        )
+        self._fill_calendars(keep_items, enabled, default_id, strict=True)
         self._emit_changed()
-        if clear_plans and self._on_clear_plans:
-            self._on_clear_plans()
 
     def _credentials_filled(self) -> bool:
         return bool(
@@ -507,6 +814,7 @@ class SettingsDialog(QDialog):
         self.icloud_enabled.setChecked(True)
         QMessageBox.information(self, "校验通过", msg or "账号密码可用")
         self._refresh_calendars_select_all(after_msg=None)
+        self._update_sync_master_ui()
         self._emit_changed()
 
     def _on_verify_close_done(self, ok: bool, msg: str) -> None:
@@ -549,7 +857,10 @@ class SettingsDialog(QDialog):
                     for it in payload
                     if isinstance(it, dict) and it.get("id")
                 }
-                self._fill_calendars(payload, all_ids)
+                # 校验后默认勾选全部 iCloud 显示 + 同步，并保留本地
+                all_ids.add(LOCAL_CALENDAR_ID)
+                sync_ids = {cid for cid in all_ids if not is_local_calendar_id(cid)}
+                self._fill_calendars(payload, all_ids, sync_ids=sync_ids)
                 self._emit_changed()
             if after_msg:
                 QMessageBox.information(self, "提示", after_msg)
@@ -605,28 +916,60 @@ class SettingsDialog(QDialog):
             self._on_changed()
 
     def icloud_settings(self) -> dict:
-        enabled = [cid for cid, cb in self._calendar_checks.items() if cb.isChecked()]
+        enabled = [
+            cid for cid, cb in self._calendar_checks.items() if cb.isChecked()
+        ]
         enabled_names = [
             self._calendar_names.get(cid, "")
             for cid in enabled
             if self._calendar_names.get(cid)
         ]
+        sync_ids = [
+            cid
+            for cid, cb in self._calendar_sync_checks.items()
+            if cb.isChecked() and not is_local_calendar_id(cid)
+        ]
+        sync_names = [
+            self._calendar_names.get(cid, "")
+            for cid in sync_ids
+            if self._calendar_names.get(cid)
+        ]
         default_id = str(self.default_calendar.currentData() or "")
-        if default_id and default_id not in enabled and enabled:
-            default_id = enabled[0]
-        elif not default_id and enabled:
-            default_id = enabled[0]
-        default_name = self._calendar_names.get(default_id, self._legacy_calendar_name)
+        if not enabled:
+            default_id = LOCAL_CALENDAR_ID
+            default_name = LOCAL_CALENDAR_NAME
+        else:
+            if default_id and default_id not in enabled:
+                default_id = enabled[0]
+            elif not default_id:
+                default_id = enabled[0]
+            default_name = self._calendar_names.get(default_id, self._legacy_calendar_name)
         return {
             "enabled": self.icloud_enabled.isChecked(),
             "apple_id": self.icloud_apple_id.text().strip(),
             "app_password": self.icloud_password.text().strip(),
-            "calendar_name": default_name or DEFAULT_CALENDAR_NAME,
+            "calendar_name": default_name or LOCAL_CALENDAR_NAME,
             "calendars_enabled": enabled,
             "calendars_enabled_names": enabled_names,
+            "calendars_sync": sync_ids,
+            "calendars_sync_names": sync_names,
+            "local_calendars": list(self._extra_local_calendars),
             "default_calendar_id": default_id,
             "poll_seconds": int(self.icloud_poll.value()),
         }
+
+    def _plan_count_for(self, cid: str, name: str = "") -> int:
+        counts = self._calendar_plan_counts
+        n = int(counts.get(cid, 0) or 0)
+        if n:
+            return n
+        if name:
+            return int(counts.get(name, 0) or 0)
+        return 0
+
+    def _calendar_label(self, cid: str, name: str) -> str:
+        n = self._plan_count_for(cid, name)
+        return f"{name} · {n} 条"
 
     def _checked_calendar_ids(self) -> set[str]:
         return {cid for cid, cb in self._calendar_checks.items() if cb.isChecked()}
@@ -645,16 +988,22 @@ class SettingsDialog(QDialog):
         default_id: str = "",
         *,
         keep_checked_names: set[str] | None = None,
+        sync_ids: set[str] | None = None,
         strict: bool = False,
     ) -> None:
+        calendars = with_local_calendar(
+            [c for c in calendars if isinstance(c, dict)],
+            extra_local=self._extra_local_calendars,
+        )
         was = self._suppress
         self._suppress = True
         try:
-            # 先记下勾选，再拆 UI（deleteLater 后 isChecked 不可靠）
+            if sync_ids is None:
+                sync_ids = set(self._sync_enabled_ids)
             if strict:
-                # 严格模式：只按传入 enabled 勾选（新建后与过滤配置对齐）
                 prev_enabled: set[str] = set()
                 prev_names: set[str] = set()
+                prev_sync: set[str] = set(sync_ids)
             else:
                 prev_enabled = self._checked_calendar_ids()
                 prev_names = (
@@ -662,16 +1011,26 @@ class SettingsDialog(QDialog):
                     if keep_checked_names is not None
                     else self._checked_calendar_names()
                 )
+                prev_sync = {
+                    cid
+                    for cid, cb in self._calendar_sync_checks.items()
+                    if cb.isChecked()
+                } or set(sync_ids)
                 if prev_enabled:
                     enabled = set(enabled) | prev_enabled
+                if prev_sync:
+                    sync_ids = set(sync_ids) | prev_sync
 
-            while self._cal_form.count():
-                item = self._cal_form.takeAt(0)
+            # 清空旧数据行
+            while self._cal_rows.count():
+                item = self._cal_rows.takeAt(0)
                 w = item.widget()
-                if w:
+                if w is not None:
                     w.deleteLater()
             self._calendar_checks.clear()
+            self._calendar_sync_checks.clear()
             self._calendar_names.clear()
+            row_i = 0
             for item in calendars:
                 if not isinstance(item, dict):
                     continue
@@ -680,33 +1039,196 @@ class SettingsDialog(QDialog):
                 if not cid or not name:
                     continue
                 self._calendar_names[cid] = name
-                cb = QCheckBox(name)
+
+                row = _CalendarListRow(alt=(row_i % 2 == 1))
+                row.name_lbl.setText(self._calendar_label(cid, name))
+                row.name_lbl.setToolTip(name)
+
+                show_cb = row.show_cb
+                show_cb.setToolTip("在主界面显示该日历的计划")
                 if strict:
-                    checked = cid in enabled
+                    show_checked = cid in enabled
                 else:
-                    checked = cid in enabled or name in prev_names
-                    if not enabled and not prev_names and name == self._legacy_calendar_name:
-                        checked = True
-                cb.blockSignals(True)
-                cb.setChecked(checked)
-                cb.blockSignals(False)
-                cb.toggled.connect(self._on_calendar_toggled)
-                self._calendar_checks[cid] = cb
-                self._cal_form.addWidget(cb)
+                    show_checked = cid in enabled or name in prev_names
+                show_cb.blockSignals(True)
+                show_cb.setChecked(show_checked)
+                show_cb.blockSignals(False)
+                show_cb.toggled.connect(self._on_calendar_toggled)
+                self._calendar_checks[cid] = show_cb
+
+                sync_cb = row.sync_cb
+                if is_local_calendar_id(cid):
+                    sync_cb.setEnabled(False)
+                    sync_cb.setChecked(False)
+                    sync_cb.setToolTip("本地日历仅保存在本机，不能同步到 iCloud")
+                else:
+                    sync_cb.setToolTip("登录 Apple 后与 iCloud 同步该日历")
+                    sync_cb.blockSignals(True)
+                    sync_cb.setChecked(cid in sync_ids)
+                    sync_cb.blockSignals(False)
+                    sync_cb.toggled.connect(self._on_calendar_toggled)
+                self._calendar_sync_checks[cid] = sync_cb
+
+                self._cal_rows.addWidget(row)
+                row_i += 1
+
             if not self._calendar_checks:
-                empty = QLabel("未发现可写日历")
-                empty.setStyleSheet("color:#A8B0BC; font-size:11px;")
-                self._cal_form.addWidget(empty)
-            self._cal_form.addStretch(1)
+                empty = QLabel("暂无日历，可在下方新建")
+                empty.setStyleSheet("color:#A8B0BC; font-size:11px; padding:8px;")
+                self._cal_rows.addWidget(empty)
+
+            self._sync_enabled_ids = {
+                cid
+                for cid, cb in self._calendar_sync_checks.items()
+                if cb.isChecked()
+            }
             self._rebuild_default_combo(default_id)
+            self._remember_partial_selections()
+            self._refresh_column_header_checks()
+            self._update_sync_master_ui()
         finally:
             self._suppress = was
+
+    def _on_show_all_toggled(self, _checked: bool = False) -> None:
+        if self._suppress or not self._calendar_checks:
+            return
+        items = list(self._calendar_checks.items())
+        all_on = all(cb.isChecked() for _, cb in items)
+        all_off = not any(cb.isChecked() for _, cb in items)
+        self._suppress = True
+        try:
+            if all_on:
+                # 全选 → 全不选
+                for _, cb in items:
+                    cb.blockSignals(True)
+                    cb.setChecked(False)
+                    cb.blockSignals(False)
+            elif all_off:
+                # 全不选 → 恢复原先勾选（无记忆则全选）
+                keep = self._show_keep_ids
+                if keep is None:
+                    for _, cb in items:
+                        cb.blockSignals(True)
+                        cb.setChecked(True)
+                        cb.blockSignals(False)
+                else:
+                    for cid, cb in items:
+                        cb.blockSignals(True)
+                        cb.setChecked(cid in keep)
+                        cb.blockSignals(False)
+            else:
+                # 原先勾选 → 记住后全选
+                self._show_keep_ids = {cid for cid, cb in items if cb.isChecked()}
+                for _, cb in items:
+                    cb.blockSignals(True)
+                    cb.setChecked(True)
+                    cb.blockSignals(False)
+        finally:
+            self._suppress = False
+        self._refresh_column_header_checks()
+        self._rebuild_default_combo()
+        self._cal_filter_debounce.start()
+
+    def _on_sync_all_toggled(self, _checked: bool = False) -> None:
+        if self._suppress or not self._calendar_sync_checks:
+            return
+        items = [
+            (cid, cb)
+            for cid, cb in self._calendar_sync_checks.items()
+            if cb.isEnabled() and not is_local_calendar_id(cid)
+        ]
+        if not items:
+            return
+        all_on = all(cb.isChecked() for _, cb in items)
+        all_off = not any(cb.isChecked() for _, cb in items)
+        self._suppress = True
+        try:
+            if all_on:
+                for _, cb in items:
+                    cb.blockSignals(True)
+                    cb.setChecked(False)
+                    cb.blockSignals(False)
+            elif all_off:
+                keep = self._sync_keep_ids
+                if keep is None:
+                    for _, cb in items:
+                        cb.blockSignals(True)
+                        cb.setChecked(True)
+                        cb.blockSignals(False)
+                else:
+                    for cid, cb in items:
+                        cb.blockSignals(True)
+                        cb.setChecked(cid in keep)
+                        cb.blockSignals(False)
+            else:
+                self._sync_keep_ids = {cid for cid, cb in items if cb.isChecked()}
+                for _, cb in items:
+                    cb.blockSignals(True)
+                    cb.setChecked(True)
+                    cb.blockSignals(False)
+        finally:
+            self._suppress = False
+        self._refresh_column_header_checks()
+        self._cal_filter_debounce.start()
+
+    def _remember_partial_selections(self) -> None:
+        """手动改行勾选时，把当前半选记为「原先勾选」。"""
+        show_items = list(self._calendar_checks.items())
+        if show_items:
+            n_on = sum(1 for _, cb in show_items if cb.isChecked())
+            if 0 < n_on < len(show_items):
+                self._show_keep_ids = {cid for cid, cb in show_items if cb.isChecked()}
+        sync_items = [
+            (cid, cb)
+            for cid, cb in self._calendar_sync_checks.items()
+            if cb.isEnabled() and not is_local_calendar_id(cid)
+        ]
+        if sync_items:
+            n_on = sum(1 for _, cb in sync_items if cb.isChecked())
+            if 0 < n_on < len(sync_items):
+                self._sync_keep_ids = {cid for cid, cb in sync_items if cb.isChecked()}
+
+    def _refresh_column_header_checks(self) -> None:
+        """表头：勾=全选，空=全不选，半勾=原先/部分勾选。"""
+        if not hasattr(self, "_show_all_cb"):
+            return
+        show_boxes = list(self._calendar_checks.values())
+        sync_boxes = [
+            cb
+            for cid, cb in self._calendar_sync_checks.items()
+            if cb.isEnabled() and not is_local_calendar_id(cid)
+        ]
+        self._show_all_cb.blockSignals(True)
+        if not show_boxes:
+            self._show_all_cb.setCheckState(Qt.CheckState.Unchecked)
+        elif all(cb.isChecked() for cb in show_boxes):
+            self._show_all_cb.setCheckState(Qt.CheckState.Checked)
+        elif any(cb.isChecked() for cb in show_boxes):
+            self._show_all_cb.setCheckState(Qt.CheckState.PartiallyChecked)
+        else:
+            self._show_all_cb.setCheckState(Qt.CheckState.Unchecked)
+        self._show_all_cb.blockSignals(False)
+
+        self._sync_all_cb.blockSignals(True)
+        if not sync_boxes:
+            self._sync_all_cb.setEnabled(False)
+            self._sync_all_cb.setCheckState(Qt.CheckState.Unchecked)
+        else:
+            self._sync_all_cb.setEnabled(True)
+            if all(cb.isChecked() for cb in sync_boxes):
+                self._sync_all_cb.setCheckState(Qt.CheckState.Checked)
+            elif any(cb.isChecked() for cb in sync_boxes):
+                self._sync_all_cb.setCheckState(Qt.CheckState.PartiallyChecked)
+            else:
+                self._sync_all_cb.setCheckState(Qt.CheckState.Unchecked)
+        self._sync_all_cb.blockSignals(False)
 
     def _on_calendar_toggled(self, _checked: bool = False) -> None:
         if self._suppress:
             return
+        self._remember_partial_selections()
+        self._refresh_column_header_checks()
         self._rebuild_default_combo()
-        # 不走完整 _emit_changed（会重样式/断开/重载定时器），只更新过滤
         self._cal_filter_debounce.start()
 
     def _flush_calendar_filter(self) -> None:
@@ -718,9 +1240,24 @@ class SettingsDialog(QDialog):
             for cid in enabled
             if self._calendar_names.get(cid)
         ]
+        sync_ids = [
+            cid
+            for cid, cb in self._calendar_sync_checks.items()
+            if cb.isChecked() and not is_local_calendar_id(cid)
+        ]
+        sync_names = [
+            self._calendar_names.get(cid, "")
+            for cid in sync_ids
+            if self._calendar_names.get(cid)
+        ]
+        self._sync_enabled_ids = set(sync_ids)
         default_id = str(self.default_calendar.currentData() or "")
+        if not enabled:
+            default_id = LOCAL_CALENDAR_ID
         if self._on_icloud_set_enabled_calendars:
-            self._on_icloud_set_enabled_calendars(enabled, default_id, names)
+            self._on_icloud_set_enabled_calendars(
+                enabled, default_id, names, sync_ids, sync_names
+            )
         else:
             self._emit_changed()
 
@@ -730,24 +1267,72 @@ class SettingsDialog(QDialog):
         current = prefer_id or str(self.default_calendar.currentData() or "")
         self.default_calendar.blockSignals(True)
         self.default_calendar.clear()
-        for cid, cb in self._calendar_checks.items():
-            if cb.isChecked():
-                self.default_calendar.addItem(self._calendar_names.get(cid, cid), cid)
-        idx = self.default_calendar.findData(current)
-        if idx >= 0:
-            self.default_calendar.setCurrentIndex(idx)
-        elif self.default_calendar.count() > 0:
+        checked = self._checked_calendar_ids()
+        if not checked:
+            self.default_calendar.addItem(
+                self._calendar_label(LOCAL_CALENDAR_ID, LOCAL_CALENDAR_NAME),
+                LOCAL_CALENDAR_ID,
+            )
             self.default_calendar.setCurrentIndex(0)
+        else:
+            for cid, cb in self._calendar_checks.items():
+                if cb.isChecked():
+                    name = self._calendar_names.get(cid, cid)
+                    self.default_calendar.addItem(self._calendar_label(cid, name), cid)
+            idx = self.default_calendar.findData(current)
+            if idx >= 0:
+                self.default_calendar.setCurrentIndex(idx)
+            elif self.default_calendar.count() > 0:
+                self.default_calendar.setCurrentIndex(0)
         self.default_calendar.blockSignals(False)
 
     def _set_icloud_busy(self, busy: bool, text: str = "") -> None:
+        self._icloud_busy = bool(busy)
         self._cred_action_btn.setEnabled(not busy)
         self._clear_account_btn.setEnabled(not busy)
         self._add_account_btn.setEnabled(not busy)
-        self._icloud_sync_btn.setEnabled(not busy)
         self._cal_refresh_btn.setEnabled(not busy)
         self._new_cal_btn.setEnabled(not busy)
+        master_on = bool(self.icloud_enabled.isChecked()) and self._creds_verified
+        self._icloud_sync_btn.setEnabled((not busy) and master_on)
         self._icloud_busy_label.setText(text if busy else "")
+
+    def _on_sync_now(self) -> None:
+        if not self._creds_verified:
+            QMessageBox.information(self, "提示", "请先校验 Apple 账号")
+            return
+        if not self.icloud_enabled.isChecked():
+            QMessageBox.information(
+                self,
+                "提示",
+                "请先勾选「启用同步」，并至少勾选一个日历的「同步」。",
+            )
+            return
+        sync_ids = [
+            cid
+            for cid, cb in self._calendar_sync_checks.items()
+            if cb.isChecked() and not is_local_calendar_id(cid)
+        ]
+        if not sync_ids:
+            QMessageBox.information(
+                self,
+                "提示",
+                "请至少勾选一个日历的「同步」后再立即同步。",
+            )
+            return
+        if not self._on_icloud_sync_now:
+            return
+        self._emit_changed()
+        self._set_icloud_busy(True, "正在同步…")
+
+        def done(ok: bool, msg: str) -> None:
+            self._set_icloud_busy(False)
+            if ok:
+                QMessageBox.information(self, "同步完成", msg)
+            else:
+                QMessageBox.warning(self, "同步失败", msg)
+
+        self._on_icloud_sync_now(self.icloud_settings(), done)
 
     def _on_refresh_calendars(self) -> None:
         if not self._creds_verified and not self._credentials_filled():
@@ -769,35 +1354,44 @@ class SettingsDialog(QDialog):
                 QMessageBox.warning(self, "刷新失败", str(payload))
                 return
             if isinstance(payload, list):
-                enabled = set(keep_ids)
-                if not enabled and not keep_names:
-                    enabled = {
-                        str(it.get("id"))
-                        for it in payload
-                        if isinstance(it, dict) and it.get("id")
-                    }
-                self._fill_calendars(payload, enabled, keep_checked_names=keep_names)
+                # 用户已全部取消勾选时保持空，不要刷新后全选回来
+                self._fill_calendars(
+                    payload, set(keep_ids), keep_checked_names=keep_names
+                )
                 self._emit_changed()
 
         self._on_icloud_refresh_calendars(self.icloud_settings(), done)
 
     def _on_create_calendar(self) -> None:
-        if not self._creds_verified:
-            QMessageBox.information(self, "提示", "请先校验 Apple 账号")
-            return
         if not self._on_icloud_create_calendar:
             return
         name = self._new_cal_name.text().strip()
         if not name:
             QMessageBox.information(self, "提示", "请输入日历名称")
             return
+        if name == LOCAL_CALENDAR_NAME:
+            QMessageBox.information(self, "提示", "「本地日历」为内置日历，请换一个名称")
+            return
         # 同时固化 id 与名称：刷新后 id 可能变，名称用于回填勾选
         keep_ids = list(self._checked_calendar_ids())
         keep_names = [n for n in self._checked_calendar_names() if n]
+        sync_ids = [
+            cid
+            for cid, cb in self._calendar_sync_checks.items()
+            if cb.isChecked() and not is_local_calendar_id(cid)
+        ]
+        sync_names = [
+            self._calendar_names.get(cid, "")
+            for cid in sync_ids
+            if self._calendar_names.get(cid)
+        ]
         default_id = str(self.default_calendar.currentData() or "")
         data = self.icloud_settings()
         data["calendars_enabled"] = keep_ids
         data["calendars_enabled_names"] = keep_names
+        data["calendars_sync"] = sync_ids
+        data["calendars_sync_names"] = sync_names
+        data["create_local"] = not self._creds_verified
         if default_id:
             data["default_calendar_id"] = default_id
         self._set_icloud_busy(True, "正在创建…")
@@ -815,8 +1409,15 @@ class SettingsDialog(QDialog):
             if not isinstance(calendars, list) or not calendars:
                 QMessageBox.warning(self, "创建失败", "已创建但未能刷新日历列表，请点「刷新」")
                 return
+            extras = payload.get("local_calendars")
+            if isinstance(extras, list):
+                self._extra_local_calendars = [
+                    {"id": str(it.get("id")), "name": str(it.get("name"))}
+                    for it in extras
+                    if isinstance(it, dict) and it.get("id") and it.get("name")
+                ]
             enabled = {str(x) for x in (payload.get("enabled") or []) if x}
-            # 再按名称兜底：防止返回的 enabled 漏了原勾选
+            sync_set = {str(x) for x in (payload.get("sync") or sync_ids) if x}
             name_keep = {
                 str(n)
                 for n in (payload.get("enabled_names") or keep_names)
@@ -834,42 +1435,40 @@ class SettingsDialog(QDialog):
             prefer_default = str(payload.get("default_id") or "")
             if prefer_default and prefer_default not in enabled and enabled:
                 prefer_default = next(iter(enabled))
+            new_id = str(payload.get("new_id") or "")
+            if new_id:
+                enabled.add(new_id)
+                # 云端新建默认勾选同步；本地新建不可同步
+                if not is_local_calendar_id(new_id):
+                    sync_set.add(new_id)
             self._fill_calendars(
                 calendars,
                 enabled,
                 prefer_default,
+                sync_ids=sync_set,
                 strict=True,
             )
-            # 勾选 UI 与过滤配置必须同一份 enabled（按 live id）
             names = [
                 str(self._calendar_names.get(cid) or "")
                 for cid in enabled
                 if self._calendar_names.get(cid)
             ]
+            sync_out = [
+                cid
+                for cid in sync_set
+                if cid in self._calendar_sync_checks and not is_local_calendar_id(cid)
+            ]
+            sync_names_out = [
+                str(self._calendar_names.get(cid) or "")
+                for cid in sync_out
+                if self._calendar_names.get(cid)
+            ]
             if self._on_icloud_set_enabled_calendars:
                 self._on_icloud_set_enabled_calendars(
-                    list(enabled), prefer_default, names
+                    list(enabled), prefer_default, names, sync_out, sync_names_out
                 )
 
         self._on_icloud_create_calendar(data, name, done)
-
-    def _on_sync_now(self) -> None:
-        if not self._creds_verified:
-            QMessageBox.information(self, "提示", "请先校验 Apple 账号")
-            return
-        if not self._on_icloud_sync_now:
-            return
-        self._emit_changed()
-        self._set_icloud_busy(True, "正在同步…")
-
-        def done(ok: bool, msg: str) -> None:
-            self._set_icloud_busy(False)
-            if ok:
-                QMessageBox.information(self, "同步完成", msg)
-            else:
-                QMessageBox.warning(self, "同步失败", msg)
-
-        self._on_icloud_sync_now(self.icloud_settings(), done)
 
     def _fill_countries(self, available: list[tuple[str, str]], selected: set[str]) -> None:
         was = self._suppress
@@ -920,6 +1519,10 @@ class SettingsDialog(QDialog):
     def opacity(self) -> float:
         return self.opacity_slider.value() / 100.0
 
+    def week_start_day(self) -> int:
+        data = self.week_starts_on.currentData()
+        return normalize_week_starts_on(data if data is not None else 6)
+
     def theme(self) -> dict[str, str]:
         return dict(self._theme)
 
@@ -930,6 +1533,9 @@ class SettingsDialog(QDialog):
         return self.start_with_windows.isChecked()
 
     def closeEvent(self, event) -> None:  # noqa: ANN001
+        if self._cal_filter_debounce.isActive():
+            self._cal_filter_debounce.stop()
+            self._flush_calendar_filter()
         if self._debounce.isActive():
             self._debounce.stop()
         if self._verify_in_progress:

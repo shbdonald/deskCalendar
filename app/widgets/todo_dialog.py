@@ -30,6 +30,8 @@ from app.services.todo_store import (
     REPEAT_NONE,
 )
 
+from app.services.local_calendar import LOCAL_CALENDAR_ID, LOCAL_CALENDAR_NAME
+
 NEW_CALENDAR_SENTINEL = "__new__"
 
 DELETE_NONE = ""
@@ -227,7 +229,10 @@ class TodoEditDialog(QDialog):
             if cid and name:
                 self.calendar_combo.addItem(name, cid)
         self.calendar_combo.addItem("新建日历…", NEW_CALENDAR_SENTINEL)
-        idx = self.calendar_combo.findData(prefer_id)
+        prefer = prefer_id
+        if not prefer and self.calendar_combo.findData(LOCAL_CALENDAR_ID) >= 0:
+            prefer = LOCAL_CALENDAR_ID
+        idx = self.calendar_combo.findData(prefer)
         if idx >= 0:
             self.calendar_combo.setCurrentIndex(idx)
         elif self.calendar_combo.count() > 1:
@@ -243,6 +248,9 @@ class TodoEditDialog(QDialog):
                 self.calendar_combo.setCurrentIndex(0)
             return
         name = str(name).strip()
+        if name == LOCAL_CALENDAR_NAME:
+            self._fill_calendars(prefer_id=LOCAL_CALENDAR_ID)
+            return
         if self._on_create_calendar:
             try:
                 info = self._on_create_calendar(name)
@@ -296,6 +304,17 @@ class TodoEditDialog(QDialog):
 
     def accept(self) -> None:
         self._cache_shown_note()
+        data = self.calendar_combo.currentData()
+        if data is None or data == NEW_CALENDAR_SENTINEL:
+            QMessageBox.information(
+                self,
+                "提示",
+                "请先选择一个日历，或点「新建日历…」创建后再保存。",
+            )
+            return
+        if not self.title_edit.text().strip():
+            QMessageBox.information(self, "提示", "请填写计划内容。")
+            return
         super().accept()
 
     @property

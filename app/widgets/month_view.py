@@ -7,7 +7,11 @@ from typing import Callable
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QGridLayout, QLabel, QSizePolicy, QWidget
 
-from app.services.calendar_math import WEEKDAY_LABELS_CN, get_month_grid
+from app.services.calendar_math import (
+    DEFAULT_WEEK_STARTS_ON,
+    get_month_grid,
+    weekday_labels_cn,
+)
 from app.services.layout_metrics import WEEKDAY_HEADER_H
 from app.widgets.day_cell import DayCell
 
@@ -25,6 +29,7 @@ class MonthView(QWidget):
         self._headers: list[QLabel] = []
         self._cells: list[DayCell] = []  # 6×7
         self._month_key: tuple[int, int] | None = None
+        self._week_starts_on = DEFAULT_WEEK_STARTS_ON
 
     def bind(
         self,
@@ -49,7 +54,7 @@ class MonthView(QWidget):
         self._cells.clear()
 
         muted = (theme or {}).get("muted", "#8B97A8")
-        for i, label in enumerate(WEEKDAY_LABELS_CN):
+        for i, label in enumerate(weekday_labels_cn(self._week_starts_on)):
             hdr = QLabel(label)
             hdr.setAlignment(Qt.AlignmentFlag.AlignCenter)
             hdr.setFixedHeight(WEEKDAY_HEADER_H)
@@ -81,15 +86,21 @@ class MonthView(QWidget):
         holiday_fn: Callable[[date], list],
         todo_fn: Callable[[date], list],
         theme: dict | None = None,
+        *,
+        week_starts_on: int = DEFAULT_WEEK_STARTS_ON,
     ) -> None:
+        self._week_starts_on = week_starts_on
         self._ensure_structure(theme)
         muted = (theme or {}).get("muted", "#8B97A8")
-        for hdr in self._headers:
+        for hdr, label in zip(
+            self._headers, weekday_labels_cn(week_starts_on), strict=True
+        ):
+            hdr.setText(label)
             hdr.setStyleSheet(
                 f"color:{muted}; font-size:11px; font-weight:600; border:none; background:transparent;"
             )
 
-        rows = get_month_grid(year, month)
+        rows = get_month_grid(year, month, week_starts_on=week_starts_on)
         idx = 0
         for week in rows:
             for d in week:

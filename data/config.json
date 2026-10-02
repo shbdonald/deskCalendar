@@ -24,12 +24,20 @@
       "btn_hover": "#3A4554",
       "border": "#00000000"
     },
+    "week_starts_on": 6,
     "icloud_sync_enabled": false,
-    "icloud_calendar_name": "桌面计划",
+    "icloud_calendar_name": "本地日历",
     "icloud_poll_seconds": 45,
-    "icloud_calendars_enabled": [],
-    "icloud_calendars_enabled_names": [],
-    "icloud_default_calendar_id": "",
+    "icloud_calendars_enabled": [
+      "local"
+    ],
+    "icloud_calendars_enabled_names": [
+      "本地日历"
+    ],
+    "icloud_calendars_sync": [],
+    "icloud_calendars_sync_names": [],
+    "local_calendars": [],
+    "icloud_default_calendar_id": "local",
     "todolist_visible": true,
     "start_with_windows": false,
     "todolist_x": 345,

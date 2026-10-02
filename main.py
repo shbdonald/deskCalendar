@@ -9,10 +9,8 @@ from pathlib import Path
 
 
 def _install_frozen_crash_log() -> None:
-    """When packaged, write uncaught errors next to the exe for diagnosis."""
-    if not getattr(sys, "frozen", False):
-        return
-    root = Path(sys.executable).resolve().parent
+    """Write uncaught errors to userdata/crash.log (dev + packaged)."""
+    root = _project_root()
     log_dir = root / "userdata"
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / "crash.log"

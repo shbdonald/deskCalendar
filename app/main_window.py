@@ -34,7 +34,11 @@ from PySide6.QtWidgets import (
 )
 
 from app.services import autostart
-from app.services.calendar_math import get_month_grid, get_week_dates
+from app.services.calendar_math import (
+    get_month_grid,
+    get_week_dates,
+    normalize_week_starts_on,
+)
 from app.services.config_store import ConfigStore
 from app.services.desktop_embed import send_to_bottom, set_topmost
 from app.services.holiday_service import HolidayService
@@ -62,6 +66,14 @@ from app.services.winamp_dock import (
     try_snap,
 )
 from app.services.icloud_calendar_sync import DEFAULT_CALENDAR_NAME, ICloudCalendarSync
+from app.services.local_calendar import (
+    LOCAL_CALENDAR_ID,
+    LOCAL_CALENDAR_NAME,
+    is_local_calendar_id,
+    is_local_plan,
+    make_local_calendar_id,
+    with_local_calendar,
+)
 from app.widgets.month_view import MonthView
 from app.widgets.settings_dialog import SettingsDialog
 from app.widgets.todo_dialog import (
@@ -197,6 +209,7 @@ class MainWindow(QMainWindow):
         self.config = ConfigStore()
         self.todos = TodoStore()
         self.icloud = ICloudCalendarSync()
+        self._ensure_local_calendar_config()
         self._icloud_jobs: list[_ICloudJob] = []
         self._todolist_syncing_vis = False
         self._todo_docked = bool(self.config.get("todolist_docked", True))
@@ -557,17 +570,14 @@ class MainWindow(QMainWindow):
 
     def _on_todolist_add(self, title: str) -> None:
         today = date.today()
-        default_id = self._icloud_default_calendar_id() or None
-        cals = self._enabled_calendars_for_ui()
-        default_name = None
-        if default_id:
+        default_id = self._effective_default_calendar_id()
+        cals = self._calendars_for_todo_dialog()
+        default_name = LOCAL_CALENDAR_NAME if is_local_calendar_id(default_id) else None
+        if not default_name:
             for c in cals:
                 if c.get("id") == default_id:
                     default_name = c.get("name")
                     break
-        if not default_name and cals:
-            default_id = cals[0].get("id") or None
-            default_name = cals[0].get("name")
         if not default_name:
             default_name = self._icloud_calendar_name()
         try:
@@ -581,6 +591,7 @@ class MainWindow(QMainWindow):
         except ValueError as exc:
             QMessageBox.warning(self.todo_list_win, "提示", str(exc))
             return
+        self._ensure_plan_calendar_visible(default_id, default_name)
         self.refresh_views()
         self._icloud_push_plan(plan["id"])
 
@@ -839,6 +850,8 @@ class MainWindow(QMainWindow):
         self.next_btn = QPushButton()
         self.prev_btn.setToolTip("上一周期")
         self.next_btn.setToolTip("下一周期")
+        self.today_btn = QPushButton("今")
+        self.today_btn.setToolTip("回到当日")
         self.title_label = QLabel("桌面日历")
         self.title_label.setObjectName("titleLabel")
         self.title_label.setMinimumWidth(140)
@@ -862,6 +875,7 @@ class MainWindow(QMainWindow):
         for btn in (
             self.prev_btn,
             self.next_btn,
+            self.today_btn,
             self.toggle_btn,
             self.lock_btn,
             self.sync_btn,
@@ -881,6 +895,7 @@ class MainWindow(QMainWindow):
         bar.addWidget(self.prev_btn)
         bar.addWidget(self.title_label, 1)
         bar.addWidget(self.next_btn)
+        bar.addWidget(self.today_btn)
         bar.addSpacing(6)
         bar.addWidget(self.toggle_btn)
         bar.addWidget(self.lock_btn)
@@ -891,6 +906,7 @@ class MainWindow(QMainWindow):
 
         self.prev_btn.clicked.connect(self._prev)
         self.next_btn.clicked.connect(self._next)
+        self.today_btn.clicked.connect(self._go_today)
         self.toggle_btn.clicked.connect(self._toggle_expand)
         self.lock_btn.clicked.connect(self._toggle_size_lock)
         self.sync_btn.clicked.connect(self._on_chrome_sync)
@@ -1448,20 +1464,34 @@ class MainWindow(QMainWindow):
         if was != expanded:
             self.refresh_views()
 
+    def _week_starts_on(self) -> int:
+        return normalize_week_starts_on(self.config.get("week_starts_on", 6))
+
     def _update_title(self) -> None:
         if self._expanded:
             self.title_label.setText(f"{self._month.year}年{self._month.month}月")
         else:
-            days = get_week_dates(self._ref)
+            days = get_week_dates(self._ref, week_starts_on=self._week_starts_on())
             self.title_label.setText(
                 f"本周  {days[0].month}/{days[0].day}–{days[-1].month}/{days[-1].day}"
             )
+        if hasattr(self, "today_btn"):
+            self.today_btn.setEnabled(not self._is_viewing_today())
+
+    def _is_viewing_today(self) -> bool:
+        today = date.today()
+        if self._expanded:
+            return self._month.year == today.year and self._month.month == today.month
+        return today in get_week_dates(self._ref, week_starts_on=self._week_starts_on())
 
     def _ensure_holiday_years(self) -> None:
         years = {self._ref.year, self._month.year}
-        for d in get_week_dates(self._ref):
+        week_start = self._week_starts_on()
+        for d in get_week_dates(self._ref, week_starts_on=week_start):
             years.add(d.year)
-        for week in get_month_grid(self._month.year, self._month.month):
+        for week in get_month_grid(
+            self._month.year, self._month.month, week_starts_on=week_start
+        ):
             for d in week:
                 years.add(d.year)
         self.holidays.ensure_years(sorted(years))
@@ -1470,6 +1500,7 @@ class MainWindow(QMainWindow):
         self._update_title()
         # 批量更新，减少勾选过滤时整窗闪烁
         self.setUpdatesEnabled(False)
+        week_start = self._week_starts_on()
         try:
             if self._expanded:
                 self.month_view.refresh(
@@ -1478,6 +1509,7 @@ class MainWindow(QMainWindow):
                     self.holidays.holidays_for,
                     self._todos_for_date,
                     theme=self._theme,
+                    week_starts_on=week_start,
                 )
             else:
                 self.week_view.refresh(
@@ -1485,15 +1517,19 @@ class MainWindow(QMainWindow):
                     self.holidays.holidays_for,
                     self._todos_for_date,
                     theme=self._theme,
+                    week_starts_on=week_start,
                 )
             self._refresh_todolist_ui()
         finally:
             self.setUpdatesEnabled(True)
 
     def _todos_for_date(self, day: date):
+        """按设置中勾选的日历过滤显示。
+
+        与「是否启用 iCloud 同步」无关：取消勾选即隐藏该日历下的计划；
+        无 calendar_id/name 的本地计划始终显示。
+        """
         items = self.todos.for_date(day)
-        if not self._icloud_enabled():
-            return items
         enabled_ids = set(self._icloud_enabled_calendar_ids())
         enabled_names = set(self._icloud_enabled_calendar_names())
         # 用当前日历缓存把启用 id 映射成名称，避免 id 漂移后过滤失效
@@ -1537,6 +1573,14 @@ class MainWindow(QMainWindow):
         self._ensure_holiday_years()
         self.refresh_views()
 
+    def _go_today(self) -> None:
+        today = date.today()
+        self._today_anchor = today
+        self._ref = today
+        self._month = date(today.year, today.month, 1)
+        self._ensure_holiday_years()
+        self.refresh_views()
+
     def _on_clock(self) -> None:
         today = date.today()
         if today == self._today_anchor:
@@ -1570,30 +1614,12 @@ class MainWindow(QMainWindow):
         dlg = TodoEditDialog(
             day,
             item=item,
-            calendars=self._enabled_calendars_for_ui(),
-            default_calendar_id=self._icloud_default_calendar_id(),
+            calendars=self._calendars_for_todo_dialog(plan=item),
+            default_calendar_id=self._effective_default_calendar_id(),
             on_create_calendar=self._create_calendar_sync,
             parent=None,
         )
-        dlg.setWindowModality(Qt.WindowModality.ApplicationModal)
-        dlg.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
-        if hasattr(self, "_bottom_timer"):
-            self._bottom_timer.stop()
-        screen = self.screen() or QGuiApplication.primaryScreen()
-        if screen is not None:
-            ag = screen.availableGeometry()
-            dlg.adjustSize()
-            geo = dlg.frameGeometry()
-            geo.moveCenter(ag.center())
-            dlg.move(geo.topLeft())
-        dlg.show()
-        dlg.raise_()
-        dlg.activateWindow()
-        accepted = dlg.exec() == TodoEditDialog.DialogCode.Accepted
-        if hasattr(self, "_bottom_timer") and self.isVisible():
-            self._bottom_timer.start()
-            self._pin_to_desktop()
-        if not accepted:
+        if not self._run_todo_dialog(dlg):
             return
         try:
             if dlg.deleted:
@@ -1647,18 +1673,107 @@ class MainWindow(QMainWindow):
             return
         self.refresh_views()
 
-    def _on_day_add(self, day: date) -> None:
-        if hasattr(self, "_bottom_timer"):
-            self._bottom_timer.stop()
-        dlg = TodoEditDialog(
-            day,
-            calendars=self._enabled_calendars_for_ui(),
-            default_calendar_id=self._icloud_default_calendar_id(),
-            on_create_calendar=self._create_calendar_sync,
-            parent=None,
+    def _checked_calendar_items(self) -> list[dict[str, str]]:
+        """当前勾选用于显示过滤的日历（含本地与自定义本地）。"""
+        by_id = {c.id: c.name for c in self.icloud.list_calendars(use_cache=True)}
+        for info in self._local_calendars_list():
+            by_id[info["id"]] = info["name"]
+        by_id[LOCAL_CALENDAR_ID] = LOCAL_CALENDAR_NAME
+        out: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for cid in self._icloud_enabled_calendar_ids():
+            if cid in seen:
+                continue
+            seen.add(cid)
+            if cid in by_id:
+                out.append({"id": cid, "name": by_id[cid]})
+            elif is_local_calendar_id(cid):
+                out.append({"id": cid, "name": cid})
+        return out
+
+    def _effective_default_calendar_id(self) -> str:
+        """新建计划默认：在勾选内；全不选时落到本地日历。"""
+        enabled = self._icloud_enabled_calendar_ids()
+        if not enabled:
+            return LOCAL_CALENDAR_ID
+        prefer = self._icloud_default_calendar_id()
+        if prefer in enabled:
+            return prefer
+        return enabled[0]
+
+    def _ensure_plan_calendar_visible(
+        self,
+        calendar_id: str | None,
+        calendar_name: str | None = None,
+    ) -> None:
+        """新建后若该日历未勾选显示，则自动勾上以便主界面可见。"""
+        cid = str(calendar_id or "").strip()
+        if not cid:
+            return
+        enabled = list(self._icloud_enabled_calendar_ids())
+        if cid in enabled:
+            return
+        names = list(self._icloud_enabled_calendar_names())
+        if is_local_calendar_id(cid):
+            if cid == LOCAL_CALENDAR_ID:
+                cname = LOCAL_CALENDAR_NAME
+            else:
+                cname = str(calendar_name or "").strip()
+                if not cname:
+                    for info in self._local_calendars_list():
+                        if info["id"] == cid:
+                            cname = info["name"]
+                            break
+                if not cname:
+                    cname = cid
+        else:
+            cname = str(calendar_name or "").strip()
+            if not cname:
+                for info in self.icloud.list_calendars(use_cache=True):
+                    if info.id == cid:
+                        cname = info.name
+                        break
+        enabled.append(cid)
+        if cname and cname not in names:
+            names.append(cname)
+        self._icloud_set_enabled_calendars(
+            enabled,
+            default_id=self._effective_default_calendar_id(),
+            enabled_names=names,
+            refresh=True,
         )
+
+    def _calendars_for_todo_dialog(
+        self, *, plan: dict | None = None
+    ) -> list[dict[str, str]]:
+        """新建/编辑对话框可选日历。全不选时新建仅本地；有勾选时仅已勾选。"""
+        if plan is None:
+            if not self._icloud_enabled_calendar_ids():
+                return [{"id": LOCAL_CALENDAR_ID, "name": LOCAL_CALENDAR_NAME}]
+            return self._checked_calendar_items()
+        out = self._checked_calendar_items()
+        seen = {x["id"] for x in out}
+        pcid = str(plan.get("calendar_id") or "")
+        pname = str(plan.get("calendar_name") or "").strip()
+        if pcid and pcid not in seen:
+            if is_local_calendar_id(pcid):
+                out.append({"id": LOCAL_CALENDAR_ID, "name": LOCAL_CALENDAR_NAME})
+            elif pname:
+                out.append({"id": pcid, "name": pname})
+        if not out:
+            if is_local_calendar_id(pcid):
+                return [{"id": LOCAL_CALENDAR_ID, "name": LOCAL_CALENDAR_NAME}]
+            if pcid and pname:
+                return [{"id": pcid, "name": pname}]
+            return [{"id": LOCAL_CALENDAR_ID, "name": LOCAL_CALENDAR_NAME}]
+        return out
+
+    def _run_todo_dialog(self, dlg: TodoEditDialog) -> bool:
+        """打开计划对话框（置顶，避免嵌桌面后模态框被挡住像卡死）。"""
         dlg.setWindowModality(Qt.WindowModality.ApplicationModal)
         dlg.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        if hasattr(self, "_bottom_timer"):
+            self._bottom_timer.stop()
         screen = self.screen() or QGuiApplication.primaryScreen()
         if screen is not None:
             ag = screen.availableGeometry()
@@ -1667,15 +1782,51 @@ class MainWindow(QMainWindow):
             geo.moveCenter(ag.center())
             dlg.move(geo.topLeft())
         dlg.show()
+        _ = dlg.winId()
+        try:
+            set_topmost(int(dlg.winId()), True)
+        except Exception:  # noqa: BLE001
+            pass
         dlg.raise_()
         dlg.activateWindow()
         accepted = dlg.exec() == TodoEditDialog.DialogCode.Accepted
+        try:
+            set_topmost(int(dlg.winId()), False)
+        except Exception:  # noqa: BLE001
+            pass
         if hasattr(self, "_bottom_timer") and self.isVisible():
             self._bottom_timer.start()
             self._pin_to_desktop()
-        if not accepted:
-            return
+        return accepted
+
+    def _on_day_add(self, day: date) -> None:
         try:
+            cals = self._calendars_for_todo_dialog()
+            if not cals:
+                box = QMessageBox(self)
+                box.setWindowTitle("提示")
+                box.setText(
+                    "当前没有可用日历。\n"
+                    "请先在设置 → iCloud 中校验账号，并勾选至少一个日历"
+                    "（或保留「新建计划默认」）。"
+                )
+                box.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+                box.show()
+                try:
+                    set_topmost(int(box.winId()), True)
+                except Exception:  # noqa: BLE001
+                    pass
+                box.exec()
+                return
+            dlg = TodoEditDialog(
+                day,
+                calendars=cals,
+                default_calendar_id=self._effective_default_calendar_id(),
+                on_create_calendar=self._create_calendar_sync,
+                parent=None,
+            )
+            if not self._run_todo_dialog(dlg):
+                return
             if dlg.repeat_mode == REPEAT_NONE:
                 detail = dlg.day_detail_text
             else:
@@ -1688,11 +1839,11 @@ class MainWindow(QMainWindow):
                 calendar_name=dlg.calendar_name,
                 detail=detail,
             )
+            self._ensure_plan_calendar_visible(dlg.calendar_id, dlg.calendar_name)
             if (
                 dlg.repeat_mode != REPEAT_NONE
                 and dlg.note_mode == NOTE_MODE_DAY
             ):
-                # 新建周期却选当日备注：拆成已完成单日 + 系列从该日起出现但跳过当日
                 series_id, new_id = self.todos.complete_recurring_day_as_standalone(
                     plan["id"], dlg.plan_date, detail=dlg.day_detail_text
                 )
@@ -1700,11 +1851,29 @@ class MainWindow(QMainWindow):
                 self._icloud_push_plan(series_id)
                 self._icloud_push_plan(new_id)
                 return
-        except ValueError as exc:
-            QMessageBox.warning(self, "提示", str(exc))
-            return
-        self.refresh_views()
-        self._icloud_push_plan(plan["id"])
+            self.refresh_views()
+            self._icloud_push_plan(plan["id"])
+        except Exception as exc:  # noqa: BLE001
+            import traceback
+            from pathlib import Path
+
+            try:
+                Path("userdata/crash.log").write_text(
+                    traceback.format_exc(), encoding="utf-8"
+                )
+            except OSError:
+                pass
+            box = QMessageBox(None)
+            box.setWindowTitle("添加计划失败")
+            box.setText(str(exc))
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+            box.show()
+            try:
+                set_topmost(int(box.winId()), True)
+            except Exception:  # noqa: BLE001
+                pass
+            box.exec()
 
     def _on_chrome_sync(self) -> None:
         if not self._icloud_enabled():
@@ -1742,12 +1911,77 @@ class MainWindow(QMainWindow):
             done,
         )
 
+    def _ensure_local_calendar_config(self) -> None:
+        """保证「本地日历」可用：无默认时落到本地；无 Apple 且未勾选任何日历时默认勾选本地。"""
+        changed = False
+        enabled = self._icloud_enabled_calendar_ids()
+        names = self._icloud_enabled_calendar_names()
+        default_id = self._icloud_default_calendar_id()
+        creds = self.icloud.load_credentials()
+        has_apple = bool(
+            str(creds.get("apple_id", "")).strip()
+            and str(creds.get("app_password", "")).strip()
+        )
+        if not default_id:
+            self.config.set("icloud_default_calendar_id", LOCAL_CALENDAR_ID, persist=False)
+            changed = True
+            default_id = LOCAL_CALENDAR_ID
+        cal_name = str(self.config.get("icloud_calendar_name", "") or "").strip()
+        if not cal_name or (
+            default_id == LOCAL_CALENDAR_ID and cal_name == DEFAULT_CALENDAR_NAME
+        ):
+            self.config.set("icloud_calendar_name", LOCAL_CALENDAR_NAME, persist=False)
+            changed = True
+        if not enabled and not has_apple:
+            self.config.set(
+                "icloud_calendars_enabled", [LOCAL_CALENDAR_ID], persist=False
+            )
+            self.config.set(
+                "icloud_calendars_enabled_names", [LOCAL_CALENDAR_NAME], persist=False
+            )
+            self.config.set("icloud_default_calendar_id", LOCAL_CALENDAR_ID, persist=False)
+            self.config.set("icloud_calendar_name", LOCAL_CALENDAR_NAME, persist=False)
+            changed = True
+        elif LOCAL_CALENDAR_ID in enabled and LOCAL_CALENDAR_NAME not in names:
+            names = list(names) + [LOCAL_CALENDAR_NAME]
+            self.config.set("icloud_calendars_enabled_names", names, persist=False)
+            changed = True
+        # 升级：若尚无「同步」列表，把已勾选的非本地日历视为默认同步
+        if "icloud_calendars_sync" not in self.config.session:
+            sync_ids = [
+                cid
+                for cid in self._icloud_enabled_calendar_ids()
+                if not is_local_calendar_id(cid)
+            ]
+            sync_names = []
+            live = {c.id: c.name for c in self.icloud.list_calendars(use_cache=True)}
+            en_names = self._icloud_enabled_calendar_names()
+            en_ids = self._icloud_enabled_calendar_ids()
+            for cid in sync_ids:
+                if cid in live:
+                    sync_names.append(live[cid])
+                else:
+                    try:
+                        sync_names.append(en_names[en_ids.index(cid)])
+                    except (ValueError, IndexError):
+                        sync_names.append(cid)
+            self.config.set("icloud_calendars_sync", sync_ids, persist=False)
+            self.config.set("icloud_calendars_sync_names", sync_names, persist=False)
+            changed = True
+        if changed:
+            self.config.save()
+
     def _icloud_enabled(self) -> bool:
         return bool(self.config.get("icloud_sync_enabled", False))
 
     def _icloud_calendar_name(self) -> str:
-        name = str(self.config.get("icloud_calendar_name", DEFAULT_CALENDAR_NAME) or "")
-        return name.strip() or DEFAULT_CALENDAR_NAME
+        name = str(self.config.get("icloud_calendar_name", LOCAL_CALENDAR_NAME) or "")
+        return name.strip() or LOCAL_CALENDAR_NAME
+
+    def _icloud_default_calendar_id(self) -> str:
+        return str(
+            self.config.get("icloud_default_calendar_id", LOCAL_CALENDAR_ID) or ""
+        ) or LOCAL_CALENDAR_ID
 
     def _icloud_enabled_calendar_ids(self) -> list[str]:
         raw = self.config.get("icloud_calendars_enabled", [])
@@ -1761,29 +1995,71 @@ class MainWindow(QMainWindow):
             return [str(x) for x in raw if x]
         return []
 
+    def _icloud_sync_calendar_ids(self) -> list[str]:
+        raw = self.config.get("icloud_calendars_sync", [])
+        if isinstance(raw, list):
+            return [str(x) for x in raw if x and not is_local_calendar_id(str(x))]
+        return []
+
+    def _icloud_sync_calendar_names(self) -> list[str]:
+        raw = self.config.get("icloud_calendars_sync_names", [])
+        if isinstance(raw, list):
+            return [str(x) for x in raw if x]
+        return []
+
+    def _local_calendars_list(self) -> list[dict[str, str]]:
+        raw = self.config.get("local_calendars", [])
+        out: list[dict[str, str]] = []
+        if not isinstance(raw, list):
+            return out
+        for it in raw:
+            if not isinstance(it, dict):
+                continue
+            cid = str(it.get("id") or "").strip()
+            name = str(it.get("name") or "").strip()
+            if cid and name and is_local_calendar_id(cid) and cid != LOCAL_CALENDAR_ID:
+                out.append({"id": cid, "name": name})
+        return out
+
     def _icloud_set_enabled_calendars(
         self,
         enabled_ids: list[str],
         *,
         default_id: str = "",
         enabled_names: list[str] | None = None,
+        sync_ids: list[str] | None = None,
+        sync_names: list[str] | None = None,
         refresh: bool = True,
     ) -> None:
-        """写入启用日历（id+名称）并重映射本地计划，供勾选与主界面过滤共用。"""
+        """写入显示勾选与同步勾选，并刷新视图。"""
         cleaned = [str(x) for x in enabled_ids if x]
         names = [str(n) for n in (enabled_names or []) if n]
         if not names:
             live = {c.id: c.name for c in self.icloud.list_calendars(use_cache=True)}
+            for info in self._local_calendars_list():
+                live[info["id"]] = info["name"]
+            live[LOCAL_CALENDAR_ID] = LOCAL_CALENDAR_NAME
             names = [live[cid] for cid in cleaned if cid in live and live[cid]]
         self.config.set("icloud_calendars_enabled", cleaned, persist=False)
         self.config.set("icloud_calendars_enabled_names", names, persist=False)
+        if sync_ids is not None:
+            sync_clean = [
+                str(x) for x in sync_ids if x and not is_local_calendar_id(str(x))
+            ]
+            snames = [str(n) for n in (sync_names or []) if n]
+            if not snames:
+                live = {c.id: c.name for c in self.icloud.list_calendars(use_cache=True)}
+                snames = [live[cid] for cid in sync_clean if cid in live and live[cid]]
+            self.config.set("icloud_calendars_sync", sync_clean, persist=False)
+            self.config.set("icloud_calendars_sync_names", snames, persist=False)
         prefer = str(default_id or "")
-        if prefer and prefer not in cleaned:
-            prefer = cleaned[0] if cleaned else ""
-        elif not prefer and cleaned:
-            prefer = cleaned[0]
-        self.config.set("icloud_default_calendar_id", prefer, persist=False)
-        if prefer:
+        if cleaned:
+            # 有显示勾选时：默认日历必须落在勾选内
+            if prefer and prefer not in cleaned:
+                prefer = cleaned[0]
+            elif not prefer:
+                prefer = cleaned[0]
+            self.config.set("icloud_default_calendar_id", prefer, persist=False)
             name = next(
                 (n for cid, n in zip(cleaned, names) if cid == prefer and n),
                 "",
@@ -1793,8 +2069,21 @@ class MainWindow(QMainWindow):
                     if info.id == prefer:
                         name = info.name
                         break
+                if not name:
+                    for info in self._local_calendars_list():
+                        if info["id"] == prefer:
+                            name = info["name"]
+                            break
+                if prefer == LOCAL_CALENDAR_ID:
+                    name = LOCAL_CALENDAR_NAME
             if name:
                 self.config.set("icloud_calendar_name", name, persist=False)
+        else:
+            # 显示过滤全空：新建默认固定为本地日历
+            if not prefer or not is_local_calendar_id(prefer):
+                prefer = LOCAL_CALENDAR_ID
+            self.config.set("icloud_default_calendar_id", prefer, persist=False)
+            self.config.set("icloud_calendar_name", LOCAL_CALENDAR_NAME, persist=False)
         self.config.save()
         self._remap_plans_calendar_ids_by_name()
         if refresh:
@@ -1808,8 +2097,12 @@ class MainWindow(QMainWindow):
         if not live_by_name:
             return
         for plan in self.todos.all_plans():
+            if is_local_plan(plan):
+                continue
             cname = str(plan.get("calendar_name") or "").strip()
             if not cname or cname not in live_by_name:
+                continue
+            if cname == LOCAL_CALENDAR_NAME:
                 continue
             info = live_by_name[cname]
             if str(plan.get("calendar_id") or "") == info.id:
@@ -1844,12 +2137,23 @@ class MainWindow(QMainWindow):
         out: list[str] = []
         seen: set[str] = set()
         for cid in enabled:
+            if is_local_calendar_id(cid):
+                if cid not in seen:
+                    out.append(cid)
+                    seen.add(cid)
+                    names.add(LOCAL_CALENDAR_NAME)
+                continue
             if cid in by_id and cid not in seen:
                 out.append(cid)
                 seen.add(cid)
                 if by_id[cid].name:
                     names.add(by_id[cid].name)
         for n in list(names):
+            if n == LOCAL_CALENDAR_NAME:
+                if LOCAL_CALENDAR_ID not in seen:
+                    out.append(LOCAL_CALENDAR_ID)
+                    seen.add(LOCAL_CALENDAR_ID)
+                continue
             info = by_name.get(n)
             if info and info.id not in seen:
                 out.append(info.id)
@@ -1857,9 +2161,14 @@ class MainWindow(QMainWindow):
         # 对不上任何 live 时绝不能写成空（否则视图会像「全没勾选」）
         if enabled and not out:
             return enabled
-        name_list = [
-            by_id[cid].name for cid in out if cid in by_id and by_id[cid].name
-        ] or sorted(names)
+        name_list = []
+        for cid in out:
+            if is_local_calendar_id(cid):
+                name_list.append(LOCAL_CALENDAR_NAME)
+            elif cid in by_id and by_id[cid].name:
+                name_list.append(by_id[cid].name)
+        if not name_list:
+            name_list = sorted(names)
         if out != enabled or name_list != self._icloud_enabled_calendar_names():
             self._icloud_set_enabled_calendars(
                 out,
@@ -1869,22 +2178,32 @@ class MainWindow(QMainWindow):
             )
         return out
 
-    def _icloud_default_calendar_id(self) -> str:
-        return str(self.config.get("icloud_default_calendar_id", "") or "")
-
-    def _enabled_calendars_for_ui(self) -> list[dict[str, str]]:
-        enabled = set(self._icloud_enabled_calendar_ids())
-        cached = self.icloud.list_calendars(use_cache=True)
-        out: list[dict[str, str]] = []
-        for info in cached:
-            if info.id in enabled:
-                out.append({"id": info.id, "name": info.name})
-        if not out and self._icloud_calendar_name():
-            out.append({"id": "", "name": self._icloud_calendar_name()})
-        return out
-
     def _create_calendar_sync(self, name: str) -> dict[str, str]:
-        """在计划对话框中同步创建日历（短阻塞；失败抛异常）。"""
+        """在计划对话框中创建日历：无 Apple 时建本地；有账号时建 iCloud。"""
+        name = (name or "").strip()
+        if not name or name == LOCAL_CALENDAR_NAME or is_local_calendar_id(name):
+            return {"id": LOCAL_CALENDAR_ID, "name": LOCAL_CALENDAR_NAME}
+        creds = self.icloud.load_credentials()
+        has_apple = bool(
+            str(creds.get("apple_id", "")).strip()
+            and str(creds.get("app_password", "")).strip()
+        )
+        if not has_apple:
+            new_id = make_local_calendar_id(name)
+            extras = self._local_calendars_list()
+            if not any(x["id"] == new_id for x in extras):
+                extras.append({"id": new_id, "name": name})
+                self.config.set("local_calendars", extras, persist=False)
+            enabled = self._icloud_enabled_calendar_ids()
+            if new_id not in enabled:
+                enabled.append(new_id)
+                names = self._icloud_enabled_calendar_names()
+                if name not in names:
+                    names.append(name)
+                self.config.set("icloud_calendars_enabled", enabled, persist=False)
+                self.config.set("icloud_calendars_enabled_names", names, persist=False)
+            self.config.save()
+            return {"id": new_id, "name": name}
         self.icloud.ensure_connected()
         info = self.icloud.ensure_calendar(name)
         enabled = self._icloud_enabled_calendar_ids()
@@ -1893,6 +2212,10 @@ class MainWindow(QMainWindow):
             self.config.set("icloud_calendars_enabled", enabled, persist=False)
             if not self._icloud_default_calendar_id():
                 self.config.set("icloud_default_calendar_id", info.id, persist=False)
+            sync = self._icloud_sync_calendar_ids()
+            if info.id not in sync:
+                sync.append(info.id)
+                self.config.set("icloud_calendars_sync", sync, persist=False)
             self.config.save()
         return {"id": info.id, "name": info.name}
 
@@ -1927,8 +2250,12 @@ class MainWindow(QMainWindow):
         job.start()
 
     def _prepare_plan_for_push(self, plan: dict) -> dict:
-        """补全默认日历字段后返回副本。"""
+        """补全默认日历字段后返回副本。本地日历计划原样返回，不改写。"""
         p = dict(plan)
+        if is_local_plan(p):
+            p["calendar_id"] = LOCAL_CALENDAR_ID
+            p["calendar_name"] = LOCAL_CALENDAR_NAME
+            return p
         if not p.get("calendar_id") and not p.get("calendar_name"):
             default_id = self._icloud_default_calendar_id()
             if default_id:
@@ -1940,9 +2267,20 @@ class MainWindow(QMainWindow):
         if not self._icloud_enabled():
             return
         plan = self.todos.get_plan(item_id)
-        if not plan:
+        if not plan or is_local_plan(plan):
             return
         plan = self._prepare_plan_for_push(plan)
+        if is_local_plan(plan):
+            return
+        sync_ids = set(self._icloud_sync_calendar_ids())
+        sync_names = set(self._icloud_sync_calendar_names())
+        cid = str(plan.get("calendar_id") or "")
+        cname = str(plan.get("calendar_name") or "").strip()
+        if sync_ids or sync_names:
+            if cid and cid not in sync_ids and cname not in sync_names:
+                return
+            if not cid and cname and cname not in sync_names:
+                return
 
         def work():
             self.icloud.ensure_connected()
@@ -1974,6 +2312,8 @@ class MainWindow(QMainWindow):
     def _icloud_delete_uid(self, uid: str, *, calendar_id: str | None = None) -> None:
         if not self._icloud_enabled() or not uid:
             return
+        if is_local_calendar_id(calendar_id):
+            return
 
         def work():
             self.icloud.ensure_connected()
@@ -1983,12 +2323,16 @@ class MainWindow(QMainWindow):
         self._run_icloud_job(work)
 
     def _prune_enabled_calendars(self, live_ids: set[str]) -> list[str]:
-        """去掉 iCloud 上已不存在的启用日历，避免反复按名重建。"""
+        """去掉 iCloud 上已不存在的启用日历，避免反复按名重建。保留本地日历。"""
         enabled = self._icloud_enabled_calendar_ids()
         # 刷新失败得到空集合时绝不清空本地勾选
         if not live_ids:
             return enabled
-        pruned = [cid for cid in enabled if cid in live_ids]
+        pruned = [
+            cid
+            for cid in enabled
+            if is_local_calendar_id(cid) or cid in live_ids
+        ]
         # 若一个都匹配不上，更可能是临时异常，保留原勾选
         if enabled and not pruned:
             return enabled
@@ -1996,10 +2340,10 @@ class MainWindow(QMainWindow):
         if changed:
             self.config.set("icloud_calendars_enabled", pruned, persist=False)
         default_id = str(self.config.get("icloud_default_calendar_id") or "")
-        if default_id and default_id not in live_ids:
+        if default_id and not is_local_calendar_id(default_id) and default_id not in live_ids:
             self.config.set(
                 "icloud_default_calendar_id",
-                pruned[0] if pruned else "",
+                pruned[0] if pruned else LOCAL_CALENDAR_ID,
                 persist=False,
             )
             changed = True
@@ -2010,12 +2354,12 @@ class MainWindow(QMainWindow):
     def _icloud_poll(self) -> None:
         if not self._icloud_enabled():
             return
-        enabled_ids = self._icloud_enabled_calendar_ids()
-        enabled_names = self._icloud_enabled_calendar_names()
+        enabled_ids = self._icloud_sync_calendar_ids()
+        enabled_names = self._icloud_sync_calendar_names()
         plans_to_push = [
             self._prepare_plan_for_push(p)
             for p in self.todos.all_plans()
-            if plan_needs_push(p)
+            if plan_needs_push(p) and not is_local_plan(p)
         ]
 
         def work():
@@ -2024,20 +2368,29 @@ class MainWindow(QMainWindow):
             live_ids = {c.id for c in cals}
             by_name = {c.name: c.id for c in cals if c.name}
             # 按 id，再按名称补齐（防止 id 漂移后 active 变空触发误删）
+            # 本地日历不参与 CalDAV active 范围
             active: list[str] = []
             seen: set[str] = set()
             for cid in enabled_ids:
+                if is_local_calendar_id(cid):
+                    continue
                 if cid in live_ids and cid not in seen:
                     active.append(cid)
                     seen.add(cid)
             for n in enabled_names:
+                if str(n) == LOCAL_CALENDAR_NAME:
+                    continue
                 cid = by_name.get(str(n))
                 if cid and cid not in seen:
                     active.append(cid)
                     seen.add(cid)
             meta: list[tuple[str, str, str | None, str | None, str | None]] = []
             for plan in plans_to_push:
+                if is_local_plan(plan):
+                    continue
                 cid = str(plan.get("calendar_id") or "")
+                if is_local_calendar_id(cid):
+                    continue
                 if active and cid and cid not in active:
                     continue
                 if active and cid and cid not in live_ids:
@@ -2120,33 +2473,123 @@ class MainWindow(QMainWindow):
         enabled = data.get("calendars_enabled")
         if isinstance(enabled, list):
             cleaned = [str(x) for x in enabled if x]
-            # 避免异步回调里读到空勾选把已有配置误清空
-            if cleaned or not self._icloud_enabled_calendar_ids():
-                names_from_ui = [
-                    str(n)
-                    for n in (data.get("calendars_enabled_names") or [])
-                    if n
-                ]
+            # UI 传入的列表一律采信（含故意清空）；勿因「空」跳过而留下旧勾选
+            names_from_ui = [
+                str(n)
+                for n in (data.get("calendars_enabled_names") or [])
+                if n
+            ]
+            live = {c.id: c.name for c in self.icloud.list_calendars(use_cache=True)}
+            names = names_from_ui or [
+                live[cid] for cid in cleaned if cid in live and live[cid]
+            ]
+            # 名称仍空时保留旧名称，供后续按名 realign（仅在仍有 id 时）
+            if not names and cleaned:
+                names = list(self._icloud_enabled_calendar_names())
+            # 补齐本地日历名称
+            if LOCAL_CALENDAR_ID in cleaned and LOCAL_CALENDAR_NAME not in names:
+                names = list(names) + [LOCAL_CALENDAR_NAME]
+            self.config.set("icloud_calendars_enabled", cleaned, persist=False)
+            self.config.set("icloud_calendars_enabled_names", names, persist=False)
+            self._remap_plans_calendar_ids_by_name()
+        sync_raw = data.get("calendars_sync")
+        if isinstance(sync_raw, list):
+            sync_clean = [
+                str(x) for x in sync_raw if x and not is_local_calendar_id(str(x))
+            ]
+            sync_names = [
+                str(n) for n in (data.get("calendars_sync_names") or []) if n
+            ]
+            if not sync_names:
                 live = {c.id: c.name for c in self.icloud.list_calendars(use_cache=True)}
-                names = names_from_ui or [
-                    live[cid] for cid in cleaned if cid in live and live[cid]
+                sync_names = [
+                    live[cid] for cid in sync_clean if cid in live and live[cid]
                 ]
-                # 名称仍空时保留旧名称，供后续按名 realign
-                if not names and cleaned:
-                    names = list(self._icloud_enabled_calendar_names())
-                self.config.set("icloud_calendars_enabled", cleaned, persist=False)
-                self.config.set("icloud_calendars_enabled_names", names, persist=False)
-                self._remap_plans_calendar_ids_by_name()
+            self.config.set("icloud_calendars_sync", sync_clean, persist=False)
+            self.config.set("icloud_calendars_sync_names", sync_names, persist=False)
+        locals_raw = data.get("local_calendars")
+        if isinstance(locals_raw, list):
+            self.config.set(
+                "local_calendars",
+                [
+                    {"id": str(it.get("id")), "name": str(it.get("name"))}
+                    for it in locals_raw
+                    if isinstance(it, dict) and it.get("id") and it.get("name")
+                ],
+                persist=False,
+            )
+        cleaned_enabled = [
+            str(x) for x in (data.get("calendars_enabled") or []) if x
+        ]
         default_id = str(data.get("default_calendar_id") or "")
-        if default_id or not self._icloud_default_calendar_id():
+        if not cleaned_enabled:
+            self.config.set("icloud_default_calendar_id", LOCAL_CALENDAR_ID, persist=False)
+            self.config.set("icloud_calendar_name", LOCAL_CALENDAR_NAME, persist=False)
+        elif default_id:
             self.config.set("icloud_default_calendar_id", default_id, persist=False)
+        elif not self._icloud_default_calendar_id():
+            self.config.set("icloud_default_calendar_id", "", persist=False)
         self.config.set(
             "icloud_poll_seconds",
             int(data.get("poll_seconds", 45) or 45),
             persist=False,
         )
+        # 无账号时：日历列表缓存只保留当前勾选（不含本地），避免设置里仍显示全部 iCloud 名
+        if not apple_id or not password:
+            slim: list[dict[str, str]] = []
+            ids = self._icloud_enabled_calendar_ids()
+            names = self._icloud_enabled_calendar_names()
+            name_by_id = {
+                c.id: c.name for c in self.icloud.list_calendars(use_cache=True)
+            }
+            for i, cid in enumerate(ids):
+                if is_local_calendar_id(cid):
+                    continue
+                cname = ""
+                if i < len(names):
+                    cname = str(names[i] or "").strip()
+                if not cname:
+                    cname = name_by_id.get(cid, "") or cid
+                if cname == LOCAL_CALENDAR_NAME and not is_local_calendar_id(cid):
+                    # 名称列表错位时再用缓存名
+                    cname = name_by_id.get(cid, cname)
+                slim.append({"id": cid, "name": cname, "writable": "1"})
+            self.icloud.replace_calendars_cache(slim)
         self.config.save()
         self._reload_icloud_timer()
+
+    def _calendars_for_settings_ui(self) -> list[dict[str, str]]:
+        """设置页日历列表：已登录显示缓存全部；未登录只显示本地+当前勾选。"""
+        creds = self.icloud.load_credentials()
+        has_apple = bool(
+            str(creds.get("apple_id", "")).strip()
+            and str(creds.get("app_password", "")).strip()
+        )
+        extras = self._local_calendars_list()
+        try:
+            cached = [
+                {"id": c.id, "name": c.name, "writable": str(int(bool(c.writable)))}
+                for c in self.icloud.list_calendars(use_cache=True)
+            ]
+        except Exception:  # noqa: BLE001
+            cached = []
+        if has_apple:
+            return with_local_calendar(cached, extra_local=extras)
+        enabled_ids = self._icloud_enabled_calendar_ids()
+        enabled_names = self._icloud_enabled_calendar_names()
+        by_id = {str(c.get("id")): c for c in cached if c.get("id")}
+        out: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for i, cid in enumerate(enabled_ids):
+            if is_local_calendar_id(cid) or cid in seen:
+                continue
+            seen.add(cid)
+            if cid in by_id:
+                out.append(by_id[cid])
+                continue
+            cname = enabled_names[i] if i < len(enabled_names) else cid
+            out.append({"id": cid, "name": str(cname or cid), "writable": "1"})
+        return with_local_calendar(out, extra_local=extras)
 
     def _icloud_test_from_dialog(self, data: dict, done) -> None:  # noqa: ANN001
         self._icloud_apply_settings_dict({**data, "enabled": True})
@@ -2168,16 +2611,13 @@ class MainWindow(QMainWindow):
         def work():
             cals = self.icloud.refresh_calendars()
             live_ids = {c.id for c in cals}
-            # 迁移：旧「桌面计划」名匹配启用
-            legacy = str(data.get("calendar_name") or DEFAULT_CALENDAR_NAME)
             enabled = [str(x) for x in (data.get("calendars_enabled") or []) if x]
-            # 去掉已在 iCloud 删除的
-            enabled = [cid for cid in enabled if cid in live_ids]
-            if not enabled:
-                for c in cals:
-                    if c.name == legacy:
-                        enabled = [c.id]
-                        break
+            # 去掉已在 iCloud 删除的；保留本地日历勾选
+            enabled = [
+                cid
+                for cid in enabled
+                if is_local_calendar_id(cid) or cid in live_ids
+            ]
             return [
                 {"id": c.id, "name": c.name, "writable": c.writable} for c in cals
             ], enabled, live_ids
@@ -2192,13 +2632,6 @@ class MainWindow(QMainWindow):
             }
             self._prune_enabled_calendars(set(live_ids))
             self._realign_enabled_ids_to_live(set(live_ids) if isinstance(live_ids, set) else set(live_ids or []))
-            # 若配置为空但刷新算出了迁移启用，写入
-            if enabled and not self._icloud_enabled_calendar_ids():
-                self._icloud_set_enabled_calendars(
-                    [str(x) for x in enabled if x],
-                    default_id=str(enabled[0]) if enabled else "",
-                    refresh=False,
-                )
             done(True, cals)
 
         def err(msg: str) -> None:
@@ -2207,32 +2640,64 @@ class MainWindow(QMainWindow):
         self._run_icloud_job(work, on_ok=ok, on_err=err)
 
     def _icloud_create_calendar_from_dialog(self, data: dict, name: str, done) -> None:  # noqa: ANN001
-        """新建日历：保留原勾选 + 勾上新建项，并以此过滤主界面显示。"""
+        """新建日历：无 Apple 时建本地日历；有账号时建 iCloud 日历。"""
+        name = (name or "").strip()
         preserved = [str(x) for x in (data.get("calendars_enabled") or []) if x]
         preserved_names = {
             str(n).strip()
             for n in (data.get("calendars_enabled_names") or [])
             if str(n).strip()
         }
+        sync_preserved = [
+            str(x)
+            for x in (data.get("calendars_sync") or [])
+            if x and not is_local_calendar_id(str(x))
+        ]
         if not preserved:
             preserved = self._icloud_enabled_calendar_ids()
-        # 配置里若只有 id，用缓存日历名补全，便于刷新后按名回填
         if preserved and not preserved_names:
             for info in self.icloud.list_calendars(use_cache=True):
                 if info.id in preserved and info.name:
                     preserved_names.add(info.name)
+            for info in self._local_calendars_list():
+                if info["id"] in preserved:
+                    preserved_names.add(info["name"])
         default_id = str(data.get("default_calendar_id") or "") or self._icloud_default_calendar_id()
-        default_name = str(data.get("calendar_name") or "").strip()
-        # 只更新凭证，不做完整 apply（避免 disconnect + 轮询与创建抢跑）
         apple_id = str(data.get("apple_id", "")).strip()
         password = str(data.get("app_password", "")).strip()
+        create_local = bool(data.get("create_local")) or not (apple_id and password)
+
+        if create_local:
+            new_id = make_local_calendar_id(name)
+            extras = self._local_calendars_list()
+            if not any(x["id"] == new_id for x in extras):
+                extras.append({"id": new_id, "name": name})
+                self.config.set("local_calendars", extras, persist=False)
+                self.config.save()
+            enabled = list(dict.fromkeys([*preserved, new_id, LOCAL_CALENDAR_ID]))
+            names_out = sorted(preserved_names | {name, LOCAL_CALENDAR_NAME})
+            cached = self._calendars_for_settings_ui()
+            done(
+                True,
+                {
+                    "calendars": cached,
+                    "local_calendars": extras,
+                    "enabled": enabled,
+                    "enabled_names": names_out,
+                    "sync": sync_preserved,
+                    "new_id": new_id,
+                    "new_name": name,
+                    "default_id": new_id,
+                },
+            )
+            return
+
         if apple_id and password:
             self.icloud.save_credentials(apple_id=apple_id, app_password=password)
 
         def work():
             self.icloud.ensure_connected()
             self.icloud.ensure_calendar(name)
-            # 必须以刷新后的列表为准，ensure 返回的 id 可能与列表不一致
             cals = self.icloud.refresh_calendars()
             live = {c.id: c for c in cals}
             by_name = {c.name: c for c in cals}
@@ -2243,20 +2708,34 @@ class MainWindow(QMainWindow):
             enabled: list[str] = []
             seen: set[str] = set()
             names_out = set(preserved_names)
-            # 1) 原 id 仍在
             for cid in preserved:
+                if is_local_calendar_id(cid):
+                    if cid not in seen:
+                        enabled.append(cid)
+                        seen.add(cid)
+                        names_out.add(
+                            LOCAL_CALENDAR_NAME
+                            if cid == LOCAL_CALENDAR_ID
+                            else next(
+                                (
+                                    x["name"]
+                                    for x in self._local_calendars_list()
+                                    if x["id"] == cid
+                                ),
+                                cid,
+                            )
+                        )
+                    continue
                 if cid in live and cid not in seen:
                     enabled.append(cid)
                     seen.add(cid)
                     names_out.add(live[cid].name)
-            # 2) id 变了：按原勾选名称找回
             for cname in list(preserved_names):
                 info = by_name.get(cname)
                 if info and info.id not in seen:
                     enabled.append(info.id)
                     seen.add(info.id)
                     names_out.add(info.name)
-            # 3) 新建项
             if new_id and new_id not in seen:
                 enabled.append(new_id)
                 seen.add(new_id)
@@ -2264,19 +2743,23 @@ class MainWindow(QMainWindow):
                 names_out.add(new_name)
 
             prefer = default_id if default_id in seen else ""
-            if not prefer and default_name:
-                info = by_name.get(default_name)
-                if info and info.id in seen:
-                    prefer = info.id
             if not prefer and enabled:
                 prefer = enabled[0]
+            sync_out = list(sync_preserved)
+            if new_id and new_id not in sync_out:
+                sync_out.append(new_id)
 
+            cal_list = [
+                {"id": c.id, "name": c.name, "writable": c.writable} for c in cals
+            ]
             return {
-                "calendars": [
-                    {"id": c.id, "name": c.name, "writable": c.writable} for c in cals
-                ],
+                "calendars": with_local_calendar(
+                    cal_list, extra_local=self._local_calendars_list()
+                ),
+                "local_calendars": self._local_calendars_list(),
                 "enabled": enabled,
                 "enabled_names": sorted(names_out),
+                "sync": sync_out,
                 "new_id": new_id,
                 "new_name": new_name,
                 "default_id": prefer,
@@ -2289,10 +2772,12 @@ class MainWindow(QMainWindow):
             enabled = [str(x) for x in (result.get("enabled") or []) if x]
             prefer = str(result.get("default_id") or "")
             names = [str(n) for n in (result.get("enabled_names") or []) if n]
+            sync_ids = [str(x) for x in (result.get("sync") or []) if x]
             self._icloud_set_enabled_calendars(
                 enabled,
                 default_id=prefer,
                 enabled_names=names,
+                sync_ids=sync_ids,
                 refresh=True,
             )
             self.config.set("icloud_sync_enabled", True, persist=False)
@@ -2305,17 +2790,24 @@ class MainWindow(QMainWindow):
         self._run_icloud_job(work, on_ok=ok, on_err=err)
 
     def _icloud_sync_now_from_dialog(self, data: dict, done) -> None:  # noqa: ANN001
-        self._icloud_apply_settings_dict({**data, "enabled": True})
-        enabled_ids = [str(x) for x in (data.get("calendars_enabled") or []) if x]
+        # 尊重「启用同步」总开关，不再强行打开
+        if not bool(data.get("enabled", False)):
+            done(False, "未启用同步。请先勾选「启用同步」。")
+            return
+        self._icloud_apply_settings_dict(data)
+        enabled_ids = [str(x) for x in (data.get("calendars_sync") or []) if x]
         if not enabled_ids:
-            enabled_ids = self._icloud_enabled_calendar_ids()
-        enabled_names = [str(x) for x in (data.get("calendars_enabled_names") or []) if x]
+            enabled_ids = self._icloud_sync_calendar_ids()
+        if not enabled_ids:
+            done(False, "没有勾选需要同步的日历。")
+            return
+        enabled_names = [str(x) for x in (data.get("calendars_sync_names") or []) if x]
         if not enabled_names:
-            enabled_names = self._icloud_enabled_calendar_names()
+            enabled_names = self._icloud_sync_calendar_names()
         plans = [
             self._prepare_plan_for_push(p)
             for p in self.todos.all_plans()
-            if plan_needs_push(p)
+            if plan_needs_push(p) and not is_local_plan(p)
         ]
 
         def work():
@@ -2326,17 +2818,25 @@ class MainWindow(QMainWindow):
             active: list[str] = []
             seen: set[str] = set()
             for cid in enabled_ids:
+                if is_local_calendar_id(cid):
+                    continue
                 if cid in live_ids and cid not in seen:
                     active.append(cid)
                     seen.add(cid)
             for n in enabled_names:
+                if str(n) == LOCAL_CALENDAR_NAME:
+                    continue
                 cid = by_name.get(str(n))
                 if cid and cid not in seen:
                     active.append(cid)
                     seen.add(cid)
             meta: list[tuple[str, str, str | None, str | None, str | None]] = []
             for plan in plans:
+                if is_local_plan(plan):
+                    continue
                 cid = str(plan.get("calendar_id") or "")
+                if is_local_calendar_id(cid):
+                    continue
                 if active and cid and cid not in active:
                     continue
                 try:
@@ -2401,14 +2901,23 @@ class MainWindow(QMainWindow):
 
         self._run_icloud_job(work, on_ok=ok, on_err=err)
 
-    def _clear_local_plans_from_dialog(self) -> None:
-        n = self.todos.clear_all()
+    def _clear_local_plans_from_dialog(
+        self,
+        calendar_ids: list[str] | None = None,
+        calendar_names: list[str] | None = None,
+    ) -> None:
+        ids = [str(x) for x in (calendar_ids or []) if x]
+        names = [str(x) for x in (calendar_names or []) if x]
+        if ids or names:
+            n = self.todos.clear_by_calendars(ids, names)
+        else:
+            n = 0
         self.refresh_views()
         self._refresh_todolist_ui()
         QMessageBox.information(
             self,
             "已清除计划",
-            f"已删除本地计划 {n} 条。" if n else "本地没有可清除的计划。",
+            f"已删除本地计划 {n} 条。" if n else "所选日历下没有可清除的计划。",
         )
 
     def _apply_start_with_windows(self, enabled: bool) -> None:
@@ -2431,13 +2940,7 @@ class MainWindow(QMainWindow):
                 self._settings_dlg = None
 
         creds = self.icloud.load_credentials()
-        try:
-            cached = [
-                {"id": c.id, "name": c.name, "writable": c.writable}
-                for c in self.icloud.list_calendars(use_cache=True)
-            ]
-        except Exception:  # noqa: BLE001
-            cached = []
+        cached = self._calendars_for_settings_ui()
 
         dlg = SettingsDialog(
             countries=self.holidays.countries(),
@@ -2452,18 +2955,24 @@ class MainWindow(QMainWindow):
                 "calendars_enabled": self._icloud_enabled_calendar_ids(),
                 "default_calendar_id": self._icloud_default_calendar_id(),
                 "calendars": cached,
+                "calendars_sync": self._icloud_sync_calendar_ids(),
+                "local_calendars": self._local_calendars_list(),
+                "calendar_plan_counts": self.todos.plan_counts_by_calendar(),
                 "poll_seconds": int(self.config.get("icloud_poll_seconds", 45) or 45),
                 "todolist_visible": bool(self.config.get("todolist_visible", True)),
                 "start_with_windows": bool(self.config.get("start_with_windows", False)),
+                "week_starts_on": self._week_starts_on(),
             },
             on_icloud_test=self._icloud_test_from_dialog,
             on_icloud_sync_now=self._icloud_sync_now_from_dialog,
             on_icloud_refresh_calendars=self._icloud_refresh_calendars_from_dialog,
             on_icloud_create_calendar=self._icloud_create_calendar_from_dialog,
-            on_icloud_set_enabled_calendars=lambda ids, default_id, names: self._icloud_set_enabled_calendars(
+            on_icloud_set_enabled_calendars=lambda ids, default_id, names, sync_ids=None, sync_names=None: self._icloud_set_enabled_calendars(
                 list(ids),
                 default_id=str(default_id or ""),
                 enabled_names=list(names or []),
+                sync_ids=list(sync_ids or []),
+                sync_names=list(sync_names or []),
                 refresh=True,
             ),
             on_clear_plans=self._clear_local_plans_from_dialog,
@@ -2499,6 +3008,7 @@ class MainWindow(QMainWindow):
             self._icloud_apply_settings_dict(dlg.icloud_settings())
             self._set_todolist_visible(dlg.show_todolist(), persist=True)
             self._apply_start_with_windows(dlg.start_on_boot())
+            self.config.set("week_starts_on", dlg.week_start_day(), persist=False)
             self.refresh_views()
             self._save_config()
             # Don't pin calendar while settings is open — keeps dialog visible.

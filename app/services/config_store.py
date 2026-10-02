@@ -223,11 +223,15 @@ STATE_KEYS: tuple[str, ...] = (
     "cell_w",
     "cell_h",
     "theme",
+    "week_starts_on",
     "icloud_sync_enabled",
     "icloud_calendar_name",
     "icloud_poll_seconds",
     "icloud_calendars_enabled",
     "icloud_calendars_enabled_names",
+    "icloud_calendars_sync",
+    "icloud_calendars_sync_names",
+    "local_calendars",
     "icloud_default_calendar_id",
     "todolist_visible",
     "start_with_windows",
@@ -254,12 +258,16 @@ FACTORY_DEFAULTS: dict[str, Any] = {
     "cell_w": _dcw,
     "cell_h": _dch,
     "theme": dict(DEFAULT_THEME),
+    "week_starts_on": 6,
     "icloud_sync_enabled": False,
-    "icloud_calendar_name": "桌面计划",
+    "icloud_calendar_name": "本地日历",
     "icloud_poll_seconds": 45,
-    "icloud_calendars_enabled": [],
-    "icloud_calendars_enabled_names": [],
-    "icloud_default_calendar_id": "",
+    "icloud_calendars_enabled": ["local"],
+    "icloud_calendars_enabled_names": ["本地日历"],
+    "icloud_calendars_sync": [],
+    "icloud_calendars_sync_names": [],
+    "local_calendars": [],
+    "icloud_default_calendar_id": "local",
     "todolist_visible": True,
     "start_with_windows": False,
     "todolist_x": int(_todo_geo.x()),
@@ -291,6 +299,28 @@ def _normalize_state(raw: dict[str, Any] | None) -> dict[str, Any]:
         elif key == "icloud_calendars_enabled_names":
             if isinstance(val, list):
                 out[key] = [str(c) for c in val if c]
+        elif key == "icloud_calendars_sync":
+            if isinstance(val, list):
+                out[key] = [str(c) for c in val if c]
+        elif key == "icloud_calendars_sync_names":
+            if isinstance(val, list):
+                out[key] = [str(c) for c in val if c]
+        elif key == "local_calendars":
+            if isinstance(val, list):
+                cleaned = []
+                for it in val:
+                    if not isinstance(it, dict):
+                        continue
+                    cid = str(it.get("id") or "").strip()
+                    name = str(it.get("name") or "").strip()
+                    if cid and name:
+                        cleaned.append({"id": cid, "name": name})
+                out[key] = cleaned
+        elif key == "week_starts_on":
+            try:
+                out[key] = int(val) % 7
+            except (TypeError, ValueError):
+                pass
         else:
             out[key] = val
     return out
