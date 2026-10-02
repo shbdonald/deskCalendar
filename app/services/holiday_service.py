@@ -69,7 +69,7 @@ class HolidayService(QObject):
         super().__init__(parent)
         self._cache: dict[tuple[str, int], list[dict[str, Any]]] = {}
         self._by_date: dict[str, list[dict[str, str]]] = {}
-        self._countries: list[str] = ["CN"]
+        self._countries: list[str] = []
         self._workers: list[QThread] = []
         self._pending_fetch: set[tuple[str, int]] = set()
         self._raw_countries: list[tuple[str, str]] = list(SEED_COUNTRIES)

@@ -258,7 +258,7 @@ class MainWindow(QMainWindow):
         self._apply_style()
         self.setWindowOpacity(float(self.config.get("opacity", 0.92)))
 
-        self.holidays.set_countries(list(self.config.get("countries", ["CN"])))
+        self.holidays.set_countries(list(self.config.get("countries", [])))
         self._ensure_holiday_years()
         # Sync UI flags without resizing — real size applied in startup_show.
         self._apply_expanded(self._expanded, persist=False, apply_size=False)
@@ -2487,7 +2487,7 @@ class MainWindow(QMainWindow):
             set_topmost(int(dlg.winId()), True)
 
         def apply_now() -> None:
-            countries = dlg.selected_countries() or ["CN"]
+            countries = list(dlg.selected_countries())
             self._theme = merge_theme(dlg.theme())
             op = dlg.opacity()
             self.setWindowOpacity(op)

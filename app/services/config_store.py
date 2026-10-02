@@ -243,7 +243,7 @@ STATE_KEYS: tuple[str, ...] = (
 FACTORY_DEFAULTS: dict[str, Any] = {
     "x": _ox,
     "y": _oy,
-    "countries": ["CN"],
+    "countries": [],
     "expanded": False,
     "opacity": 0.92,
     "size_locked": True,

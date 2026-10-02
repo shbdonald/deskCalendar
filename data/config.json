@@ -2,9 +2,7 @@
   "defaults": {
     "x": 80,
     "y": 5,
-    "countries": [
-      "CN"
-    ],
+    "countries": [],
     "expanded": false,
     "opacity": 0.92,
     "size_locked": true,
